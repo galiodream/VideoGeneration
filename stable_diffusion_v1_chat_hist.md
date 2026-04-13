@@ -11916,3 +11916,878 @@ L = L_{pixel} + \lambda_{perc}L_{LPIPS} + \lambda_{KL}L_{KL} + \lambda_{GAN}L_G
 - `taming` 的判别器实现: https://huggingface.co/spaces/multimodalart/latentdiffusion/blame/main/taming-transformers/taming/modules/discriminator/model.py
 
 如果你愿意，我下一步可以直接把这个 `LPIPSWithDiscriminator.forward()` 逐行拆开，告诉你每一项 loss 在训练时分别更新谁。
+
+## [#47] User
+- Timestamp: `2026-04-14 01:33:20`
+
+# Context from my IDE setup:
+
+## Active file: ldm/modules/losses/contperceptual.py
+
+## Active selection of the file:
+calculate_adaptive_weight
+## Open tabs:
+- contperceptual.py: ldm/modules/losses/contperceptual.py
+- rollout-2026-04-13T22-32-49-019d8742-67bb-7c21-a81f-b742af8e39d1.md: <PATH>
+- distributions.py: ldm/modules/distributions/distributions.py
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- autoencoder.py: ldm/models/autoencoder.py
+
+## My request for Codex:
+这里的动态weight的实现原理是什么，还是说这里是固定的weight
+
+## [#48] Assistant
+- Timestamp: `2026-04-14 01:33:53`
+
+这里是**动态 weight**，不是固定 weight。
+
+你看的函数在：
+[contperceptual.py:32](<PATH>)
+
+```python
+def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
+```
+
+它的作用是：
+
+> 根据当前 batch 里“重建项”和“GAN 项”对生成器最后一层参数造成的梯度大小，动态调整 GAN loss 的权重。
+
+---
+
+**先看它怎么算**
+
+[contperceptual.py:34](<PATH>)
+
+```python
+nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
+g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+```
+
+它先分别求：
+
+- `nll_loss` 对最后一层参数的梯度
+- `g_loss` 对最后一层参数的梯度
+
+然后算两者范数比值：
+
+[contperceptual.py:40](<PATH>)
+
+```python
+d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+```
+
+也就是：
+
+\[
+d\_weight = \frac{\|\nabla_{\theta_{last}} L_{nll}\|}{\|\nabla_{\theta_{last}} L_G\| + \epsilon}
+\]
+
+最后再裁剪并乘一个全局系数：
+
+[contperceptual.py:41](<PATH>)
+
+```python
+d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+d_weight = d_weight * self.discriminator_weight
+```
+
+---
+
+**它的原理是什么**
+
+核心思想是：
+
+> 不直接按 loss 数值大小平衡，而按“对参数更新的实际影响强弱”来平衡。
+
+因为不同 loss 的数值尺度经常不能直接比较：
+
+- 一个 loss 数值可能小，但梯度很大
+- 另一个 loss 数值可能大，但梯度很小
+
+真正影响训练的是梯度，不是 loss 的绝对数值。
+
+所以这里选择比较：
+
+- 重建项梯度强度
+- GAN 项梯度强度
+
+如果 GAN 项梯度太小，就把它放大一点。
+如果 GAN 项梯度太大，就把它压小一点。
+
+这样可以让两部分对生成器训练的贡献更平衡。
+
+---
+
+**为什么选“最后一层”来比较**
+
+这里不是对全网参数求梯度比，而是只看 `last_layer`。
+
+调用点在 `AutoencoderKL`：
+
+[autoencoder.py:357](<PATH>)
+
+```python
+last_layer=self.get_last_layer()
+```
+
+而 `get_last_layer()` 返回的是：
+
+[autoencoder.py:397](<PATH>)
+
+```python
+return self.decoder.conv_out.weight
+```
+
+也就是 decoder 最后一层卷积权重。
+
+原因一般是：
+
+- 这个位置直接影响最终图像输出
+- 是生成器最靠近像素空间的层
+- 用它来衡量不同 loss 对“最终视觉输出”的驱动力比较直观
+- 计算也更便宜、更稳定
+
+---
+
+**那这里有没有固定 weight**
+
+有，但它是**动态 weight 之外的固定全局系数**。
+
+固定部分有两个：
+
+1. `self.discriminator_weight`
+   [contperceptual.py:29](<PATH>)
+
+```python
+self.discriminator_weight = disc_weight
+```
+
+2. `disc_factor`
+   [contperceptual.py:82](<PATH>)
+
+```python
+disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+```
+
+它会在训练早期把 GAN 项关掉，超过 `disc_start` 才打开。
+
+所以最终 GAN 权重不是单一固定值，而是：
+
+\[
+\lambda_{GAN}^{final} = d\_weight \cdot disc\_factor
+\]
+
+其中：
+
+- `d_weight` 是动态算的
+- `disc_factor` 是按训练步数调度的
+- `self.discriminator_weight` 是固定超参数，已经乘进 `d_weight` 里了
+
+---
+
+**总 loss 里它怎么用**
+
+[contperceptual.py:83](<PATH>)
+
+```python
+loss = weighted_nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
+```
+
+所以生成器总损失可以写成：
+
+\[
+L = L_{rec} + \lambda_{KL}L_{KL} + \lambda_{adv}(t, batch)\,L_G
+\]
+
+其中：
+
+\[
+\lambda_{adv}(t, batch)
+=
+disc\_factor(t)\cdot
+\left(
+disc\_weight \cdot
+\frac{\|\nabla_{\theta_{last}}L_{nll}\|}{\|\nabla_{\theta_{last}}L_G\|+\epsilon}
+\right)
+\]
+
+这是一个**和训练步数、当前 batch 梯度状态都相关的动态权重**。
+
+---
+
+**直觉上它在解决什么问题**
+
+如果直接给 GAN loss 一个固定权重，比如 `0.5`，常见问题是：
+
+- 早期 GAN 太强，重建学崩
+- 或 GAN 太弱，根本起不到锐化细节的作用
+- 不同数据集、不同分辨率、不同架构下最佳系数差别很大
+
+动态权重就是在缓解这种手工调参困难。
+
+它的目标不是“数学上最优”，而是：
+
+> 让 reconstruction / perceptual / GAN 这几股力量对 decoder 的拉扯处于相对合理的平衡状态
+
+---
+
+**一句话结论**
+
+这里不是固定 weight，而是**基于梯度范数比的自适应动态权重**。
+它通过比较 `nll_loss` 和 `g_loss` 对 decoder 最后一层的梯度强度，动态调整 GAN loss 的权重，再乘上一个固定超参和训练步数调度因子。
+
+如果你愿意，我下一步可以继续把：
+
+- `adopt_weight()` 的作用
+- 为什么 `disc_start=50001`
+- 训练前 5 万步为什么先不启用 GAN
+
+这几个点连起来讲清楚。
+
+## [#49] User
+- Timestamp: `2026-04-14 01:35:21`
+
+# Context from my IDE setup:
+
+## Active file: ldm/modules/losses/contperceptual.py
+
+## Open tabs:
+- contperceptual.py: ldm/modules/losses/contperceptual.py
+- rollout-2026-04-13T22-32-49-019d8742-67bb-7c21-a81f-b742af8e39d1.md: <PATH>
+- distributions.py: ldm/modules/distributions/distributions.py
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- autoencoder.py: ldm/models/autoencoder.py
+
+## My request for Codex:
+连起来讲一下
+
+## [#50] Assistant
+- Timestamp: `2026-04-14 01:35:31`
+
+我把这三件事串起来讲：`adopt_weight()` 怎么控制 GAN 何时接入、`disc_start=50001` 为什么这么设，以及动态权重怎么在这个时机上继续做细调。这样你能看到完整训练策略，而不只是单个函数。
+
+## [tool] exec_command
+- Call ID: `call_yTC21WDSXjWcxjhwtW7JLWCE`
+- Timestamp: `2026-04-14 01:35:31`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/losses/vqperceptual.py | sed -n '1,140p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 5000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_Eh92t6MCgfB7o37Dadhv5ODj`
+- Timestamp: `2026-04-14 01:35:31`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba configs/autoencoder/autoencoder_kl_32x32x4.yaml | sed -n '1,40p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_QK4MFukjYB5pXNFeV9mRzwg3`
+- Timestamp: `2026-04-14 01:35:31`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/losses/contperceptual.py | sed -n '60,110p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 3000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_yTC21WDSXjWcxjhwtW7JLWCE`
+- Timestamp: `2026-04-14 01:35:31`
+
+### Output
+```
+Chunk ID: b83416
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1863
+Output:
+     1	import torch
+     2	from torch import nn
+     3	import torch.nn.functional as F
+     4	from einops import repeat
+     5	
+     6	from taming.modules.discriminator.model import NLayerDiscriminator, weights_init
+     7	from taming.modules.losses.lpips import LPIPS
+     8	from taming.modules.losses.vqperceptual import hinge_d_loss, vanilla_d_loss
+     9	
+    10	
+    11	def hinge_d_loss_with_exemplar_weights(logits_real, logits_fake, weights):
+    12	    assert weights.shape[0] == logits_real.shape[0] == logits_fake.shape[0]
+    13	    loss_real = torch.mean(F.relu(1. - logits_real), dim=[1,2,3])
+    14	    loss_fake = torch.mean(F.relu(1. + logits_fake), dim=[1,2,3])
+    15	    loss_real = (weights * loss_real).sum() / weights.sum()
+    16	    loss_fake = (weights * loss_fake).sum() / weights.sum()
+    17	    d_loss = 0.5 * (loss_real + loss_fake)
+    18	    return d_loss
+    19	
+    20	def adopt_weight(weight, global_step, threshold=0, value=0.):
+    21	    if global_step < threshold:
+    22	        weight = value
+    23	    return weight
+    24	
+    25	
+    26	def measure_perplexity(predicted_indices, n_embed):
+    27	    # src: https://github.com/karpathy/deep-vector-quantization/blob/main/model.py
+    28	    # eval cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
+    29	    encodings = F.one_hot(predicted_indices, n_embed).float().reshape(-1, n_embed)
+    30	    avg_probs = encodings.mean(0)
+    31	    perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
+    32	    cluster_use = torch.sum(avg_probs > 0)
+    33	    return perplexity, cluster_use
+    34	
+    35	def l1(x, y):
+    36	    return torch.abs(x-y)
+    37	
+    38	
+    39	def l2(x, y):
+    40	    return torch.pow((x-y), 2)
+    41	
+    42	
+    43	class VQLPIPSWithDiscriminator(nn.Module):
+    44	    def __init__(self, disc_start, codebook_weight=1.0, pixelloss_weight=1.0,
+    45	                 disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
+    46	                 perceptual_weight=1.0, use_actnorm=False, disc_conditional=False,
+    47	                 disc_ndf=64, disc_loss="hinge", n_classes=None, perceptual_loss="lpips",
+    48	                 pixel_loss="l1"):
+    49	        super().__init__()
+    50	        assert disc_loss in ["hinge", "vanilla"]
+    51	        assert perceptual_loss in ["lpips", "clips", "dists"]
+    52	        assert pixel_loss in ["l1", "l2"]
+    53	        self.codebook_weight = codebook_weight
+    54	        self.pixel_weight = pixelloss_weight
+    55	        if perceptual_loss == "lpips":
+    56	            print(f"{self.__class__.__name__}: Running with LPIPS.")
+    57	            self.perceptual_loss = LPIPS().eval()
+    58	        else:
+    59	            raise ValueError(f"Unknown perceptual loss: >> {perceptual_loss} <<")
+    60	        self.perceptual_weight = perceptual_weight
+    61	
+    62	        if pixel_loss == "l1":
+    63	            self.pixel_loss = l1
+    64	        else:
+    65	            self.pixel_loss = l2
+    66	
+    67	        self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
+    68	                                                 n_layers=disc_num_layers,
+    69	                                                 use_actnorm=use_actnorm,
+    70	                                                 ndf=disc_ndf
+    71	                                                 ).apply(weights_init)
+    72	        self.discriminator_iter_start = disc_start
+    73	        if disc_loss == "hinge":
+    74	            self.disc_loss = hinge_d_loss
+    75	        elif disc_loss == "vanilla":
+    76	            self.disc_loss = vanilla_d_loss
+    77	        else:
+    78	            raise ValueError(f"Unknown GAN loss '{disc_loss}'.")
+    79	        print(f"VQLPIPSWithDiscriminator running with {disc_loss} loss.")
+    80	        self.disc_factor = disc_factor
+    81	        self.discriminator_weight = disc_weight
+    82	        self.disc_conditional = disc_conditional
+    83	        self.n_classes = n_classes
+    84	
+    85	    def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
+    86	        if last_layer is not None:
+    87	            nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
+    88	            g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+    89	        else:
+    90	            nll_grads = torch.autograd.grad(nll_loss, self.last_layer[0], retain_graph=True)[0]
+    91	            g_grads = torch.autograd.grad(g_loss, self.last_layer[0], retain_graph=True)[0]
+    92	
+    93	        d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+    94	        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+    95	        d_weight = d_weight * self.discriminator_weight
+    96	        return d_weight
+    97	
+    98	    def forward(self, codebook_loss, inputs, reconstructions, optimizer_idx,
+    99	                global_step, last_layer=None, cond=None, split="train", predicted_indices=None):
+   100	        if not exists(codebook_loss):
+   101	            codebook_loss = torch.tensor([0.]).to(inputs.device)
+   102	        #rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
+   103	        rec_loss = self.pixel_loss(inputs.contiguous(), reconstructions.contiguous())
+   104	        if self.perceptual_weight > 0:
+   105	            p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
+   106	            rec_loss = rec_loss + self.perceptual_weight * p_loss
+   107	        else:
+   108	            p_loss = torch.tensor([0.0])
+   109	
+   110	        nll_loss = rec_loss
+   111	        #nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
+   112	        nll_loss = torch.mean(nll_loss)
+   113	
+   114	        # now the GAN part
+   115	        if optimizer_idx == 0:
+   116	            # generator update
+   117	            if cond is None:
+   118	                assert not self.disc_conditional
+   119	                logits_fake = self.discriminator(reconstructions.contiguous())
+   120	            else:
+   121	                assert self.disc_conditional
+   122	                logits_fake = self.discriminator(torch.cat((reconstructions.contiguous(), cond), dim=1))
+   123	            g_loss = -torch.mean(logits_fake)
+   124	
+   125	            try:
+   126	                d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
+   127	            except RuntimeError:
+   128	                assert not self.training
+   129	                d_weight = torch.tensor(0.0)
+   130	
+   131	            disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+   132	            loss = nll_loss + d_weight * disc_factor * g_loss + self.codebook_weight * codebook_loss.mean()
+   133	
+   134	            log = {"{}/total_loss".format(split): loss.clone().detach().mean(),
+   135	                   "{}/quant_loss".format(split): codebook_loss.detach().mean(),
+   136	                   "{}/nll_loss".format(split): nll_loss.detach().mean(),
+   137	                   "{}/rec_loss".format(split): rec_loss.detach().mean(),
+   138	                   "{}/p_loss".format(split): p_loss.detach().mean(),
+   139	                   "{}/d_weight".format(split): d_weight.detach(),
+   140	                   "{}/disc_factor".format(split): torch.tensor(disc_factor),
+
+```
+
+## [tool output]
+- Call ID: `call_Eh92t6MCgfB7o37Dadhv5ODj`
+- Timestamp: `2026-04-14 01:35:31`
+
+### Output
+```
+Chunk ID: 03bc05
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 296
+Output:
+     1	model:
+     2	  base_learning_rate: 4.5e-6
+     3	  target: ldm.models.autoencoder.AutoencoderKL
+     4	  params:
+     5	    monitor: "val/rec_loss"
+     6	    embed_dim: 4
+     7	    lossconfig:
+     8	      target: ldm.modules.losses.LPIPSWithDiscriminator
+     9	      params:
+    10	        disc_start: 50001
+    11	        kl_weight: 0.000001
+    12	        disc_weight: 0.5
+    13	
+    14	    ddconfig:
+    15	      double_z: True
+    16	      z_channels: 4
+    17	      resolution: 256
+    18	      in_channels: 3
+    19	      out_ch: 3
+    20	      ch: 128
+    21	      ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    22	      num_res_blocks: 2
+    23	      attn_resolutions: [ ]
+    24	      dropout: 0.0
+    25	
+    26	data:
+    27	  target: main.DataModuleFromConfig
+    28	  params:
+    29	    batch_size: 12
+    30	    wrap: True
+    31	    train:
+    32	      target: ldm.data.imagenet.ImageNetSRTrain
+    33	      params:
+    34	        size: 256
+    35	        degradation: pil_nearest
+    36	    validation:
+    37	      target: ldm.data.imagenet.ImageNetSRValidation
+    38	      params:
+    39	        size: 256
+    40	        degradation: pil_nearest
+
+```
+
+### Output
+```
+Chunk ID: 690be0
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 759
+Output:
+    60	        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+    61	
+    62	        # now the GAN part
+    63	        if optimizer_idx == 0:
+    64	            # generator update
+    65	            if cond is None:
+    66	                assert not self.disc_conditional
+    67	                logits_fake = self.discriminator(reconstructions.contiguous())
+    68	            else:
+    69	                assert self.disc_conditional
+    70	                logits_fake = self.discriminator(torch.cat((reconstructions.contiguous(), cond), dim=1))
+    71	            g_loss = -torch.mean(logits_fake)
+    72	
+    73	            if self.disc_factor > 0.0:
+    74	                try:
+    75	                    d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
+    76	                except RuntimeError:
+    77	                    assert not self.training
+    78	                    d_weight = torch.tensor(0.0)
+    79	            else:
+    80	                d_weight = torch.tensor(0.0)
+    81	
+    82	            disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+    83	            loss = weighted_nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
+    84	
+    85	            log = {"{}/total_loss".format(split): loss.clone().detach().mean(), "{}/logvar".format(split): self.logvar.detach(),
+    86	                   "{}/kl_loss".format(split): kl_loss.detach().mean(), "{}/nll_loss".format(split): nll_loss.detach().mean(),
+    87	                   "{}/rec_loss".format(split): rec_loss.detach().mean(),
+    88	                   "{}/d_weight".format(split): d_weight.detach(),
+    89	                   "{}/disc_factor".format(split): torch.tensor(disc_factor),
+    90	                   "{}/g_loss".format(split): g_loss.detach().mean(),
+    91	                   }
+    92	            return loss, log
+    93	
+    94	        if optimizer_idx == 1:
+    95	            # second pass for discriminator update
+    96	            if cond is None:
+    97	                logits_real = self.discriminator(inputs.contiguous().detach())
+    98	                logits_fake = self.discriminator(reconstructions.contiguous().detach())
+    99	            else:
+   100	                logits_real = self.discriminator(torch.cat((inputs.contiguous().detach(), cond), dim=1))
+   101	                logits_fake = self.discriminator(torch.cat((reconstructions.contiguous().detach(), cond), dim=1))
+   102	
+   103	            disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+   104	            d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
+   105	
+   106	            log = {"{}/disc_loss".format(split): d_loss.clone().detach().mean(),
+   107	                   "{}/logits_real".format(split): logits_real.detach().mean(),
+   108	                   "{}/logits_fake".format(split): logits_fake.detach().mean()
+   109	                   }
+   110	            return d_loss, log
+
+```
+
+## [#51] Assistant
+- Timestamp: `2026-04-14 01:36:14`
+
+可以，我们把这套策略连成一条线来看。这个 VAE 的训练不是“一上来就同时优化重建 + KL + GAN”，而是分阶段接入 GAN，并且接入后还会动态调权。
+
+**1. 先看总损失长什么样**
+
+生成器分支在这里：
+
+[contperceptual.py:83](<PATH>)
+
+```python
+loss = weighted_nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
+```
+
+可以写成：
+
+\[
+L_{gen} = L_{rec} + \lambda_{KL} L_{KL} + \lambda_{adv} L_G
+\]
+
+其中：
+
+\[
+\lambda_{adv} = d\_weight \cdot disc\_factor
+\]
+
+所以 GAN 项真正起作用，不是只看 `g_loss`，而是要同时看：
+
+- `d_weight`：动态权重
+- `disc_factor`：训练阶段开关
+
+---
+
+**2. `adopt_weight()` 在做什么**
+
+这个函数的语义非常简单：
+
+[ldm/modules/losses/vqperceptual.py:20](<PATH>)
+
+```python
+def adopt_weight(weight, global_step, threshold=0, value=0.):
+    if global_step < threshold:
+        weight = value
+    return weight
+```
+
+也就是：
+
+\[
+\text{adopt\_weight}(w, step, threshold)=
+\begin{cases}
+0, & step < threshold \\
+w, & step \ge threshold
+\end{cases}
+\]
+
+在当前 loss 里，它被这样调用：
+
+[contperceptual.py:82](<PATH>)
+
+```python
+disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+```
+
+所以 `disc_factor` 不是一直等于 `self.disc_factor`，而是：
+
+- 前期：`0`
+- 到了阈值后：`self.disc_factor`
+
+这就是一个“延迟启用 GAN”的机制。
+
+---
+
+**3. `disc_start=50001` 是什么意思**
+
+这个值来自配置：
+
+[autoencoder_kl_32x32x4.yaml:10](<PATH>)
+
+```yaml
+disc_start: 50001
+```
+
+也就是说：
+
+> 训练前 50000 step，GAN 项不参与有效优化；从第 50001 step 开始，GAN 才正式接入。
+
+所以训练可以分成两个阶段：
+
+### 阶段 A：前 50000 step
+只让 VAE 先把基础重建学稳。
+
+这时等价于：
+
+\[
+disc\_factor = 0
+\]
+
+于是：
+
+\[
+L_{gen} = L_{rec} + \lambda_{KL}L_{KL}
+\]
+
+GAN 项虽然代码里可能算了 `g_loss`，但最后乘上 `disc_factor=0`，**对参数更新没有贡献**。
+
+判别器分支同理：
+
+[contperceptual.py:103](<PATH>)
+
+```python
+d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
+```
+
+因为 `disc_factor=0`，所以：
+
+\[
+L_D = 0
+\]
+
+判别器实际也不更新。
+
+### 阶段 B：从 50001 step 开始
+GAN 开始真正介入。
+
+这时：
+
+\[
+disc\_factor = self.disc\_factor
+\]
+
+于是生成器和判别器开始对抗训练。
+
+---
+
+**4. 为什么前 5 万步先不开 GAN**
+
+原因很务实：**GAN 太早介入，容易把 VAE 训练带偏**。
+
+如果一开始就开 GAN，常见问题是：
+
+- encoder / decoder 还没学会基本重建
+- 判别器很快学会分辨“重建图很假”
+- 生成器为了骗判别器，会追一些表面纹理
+- 结果内容结构不稳，训练容易震荡甚至崩掉
+
+而 VAE 的第一要务其实是先学会：
+
+1. 基本可逆压缩
+2. 合理 latent 分布
+3. 稳定重建轮廓和语义
+
+所以先用：
+
+- 重建项
+- KL 项
+
+把“骨架”学稳，再让 GAN 去补细节，这是一个很常见的训练策略。
+
+你可以把它理解成：
+
+- 前期先学“画得对”
+- 后期再学“画得像真图”
+
+---
+
+**5. 那动态权重 `d_weight` 又在干什么**
+
+函数在：
+
+[contperceptual.py:32](<PATH>)
+
+```python
+def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
+```
+
+核心公式：
+
+[contperceptual.py:40](<PATH>)
+
+```python
+d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+```
+
+也就是：
+
+\[
+d\_weight =
+\frac{\|\nabla_{\theta_{last}}L_{nll}\|}
+{\|\nabla_{\theta_{last}}L_G\|+\epsilon}
+\]
+
+含义是：
+
+> 比较“重建项”和“GAN 项”对 decoder 最后一层参数的梯度强度，然后把 GAN 项调到和重建项处在类似量级。
+
+如果 GAN 梯度太弱：
+
+- 分母小
+- `d_weight` 变大
+- GAN 项被放大
+
+如果 GAN 梯度太强：
+
+- 分母大
+- `d_weight` 变小
+- GAN 项被压小
+
+所以它不是固定权重，而是一个**按当前 batch 梯度状态自适应变化的系数**。
+
+---
+
+**6. 这两个机制怎么配合**
+
+这才是关键。
+
+### 第一层控制：`disc_factor`
+控制“GAN 什么时候开始起作用”。
+
+- 训练前期：直接关掉
+- 训练后期：打开
+
+它解决的是**训练时机**问题。
+
+### 第二层控制：`d_weight`
+控制“GAN 打开后，到底该有多大力度”。
+
+它解决的是**力度平衡**问题。
+
+两者乘起来：
+
+\[
+\lambda_{adv} = disc\_factor \cdot d\_weight
+\]
+
+所以整体策略其实是：
+
+1. 先不让 GAN 干扰基础重建
+2. 等 VAE 稳了，再启用 GAN
+3. 启用后也不粗暴给固定系数
+4. 而是根据当前梯度强弱自动平衡 GAN 项
+
+---
+
+**7. 再把整个训练过程按时间顺序讲一遍**
+
+### 训练初期
+目标：先学稳定重建。
+
+有效损失近似：
+
+\[
+L \approx L_{rec} + \lambda_{KL}L_{KL}
+\]
+
+此时：
+
+- decoder 学会恢复图像结构
+- encoder 学会组织潜变量
+- latent 空间开始规整
+
+GAN 这时不介入，避免训练不稳。
+
+### 训练中后期
+目标：在保持重建和 latent 规整的同时，提高视觉真实感。
+
+有效损失变成：
+
+\[
+L = L_{rec} + \lambda_{KL}L_{KL} + d\_weight \cdot disc\_factor \cdot L_G
+\]
+
+此时：
+
+- `L_rec` 保证内容和结构别跑偏
+- `L_KL` 保证 latent 分布别散掉
+- `L_G` 推动解码图像更锐利、更真实
+- `d_weight` 防止 GAN 压过重建项，或者弱到没存在感
+
+---
+
+**8. 为什么不是直接用一个固定 GAN 权重**
+
+因为固定权重很难泛化：
+
+- 不同分辨率，loss 尺度不一样
+- 不同数据集，判别器强弱不一样
+- 不同训练阶段，GAN 和 reconstruction 的梯度强度变化很大
+
+所以如果直接设：
+
+\[
+L = L_{rec} + 0.5 L_G
+\]
+
+经常会遇到：
+
+- 0.5 太大，训练炸
+- 0.5 太小，GAN 没效果
+
+动态权重的好处就是：
+
+> 不用只盯着 loss 数值，而是盯着对参数更新真正有影响的梯度强度。
+
+---
+
+**9. 一句最浓缩的总结**
+
+这套机制可以总结成一句话：
+
+> 先用 `disc_start` 把 GAN 延后接入，确保 VAE 先学稳；等 GAN 开始工作后，再用 `calculate_adaptive_weight()` 按梯度范数动态平衡 GAN 项和重建项，避免 GAN 过强或过弱。
+
+如果你愿意，我下一步可以继续把这条链再往前接一层，把 `weighted_nll_loss + KL + GAN` 和 `AutoencoderKL.training_step()` 里的两个 optimizer 分支一起串起来讲。
