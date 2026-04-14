@@ -12791,3 +12791,6739 @@ L = L_{rec} + 0.5 L_G
 > 先用 `disc_start` 把 GAN 延后接入，确保 VAE 先学稳；等 GAN 开始工作后，再用 `calculate_adaptive_weight()` 按梯度范数动态平衡 GAN 项和重建项，避免 GAN 过强或过弱。
 
 如果你愿意，我下一步可以继续把这条链再往前接一层，把 `weighted_nll_loss + KL + GAN` 和 `AutoencoderKL.training_step()` 里的两个 optimizer 分支一起串起来讲。
+
+## [#52] User
+- Timestamp: `2026-04-14 23:35:28`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+class DDPM(pl.LightningModule):
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (line 44)
+
+## My request for Codex:
+对照DDPM论文的公式实现详细解析DDPM这个类的实现
+
+## [#53] Assistant
+- Timestamp: `2026-04-14 23:35:41`
+
+我先把 `DDPM` 这一段完整拉出来，按论文里的 `q(x_t|x_0)`、训练目标、反向采样 `p_\theta(x_{t-1}|x_t)` 三条主线对照代码。这样我们能把每个公式直接映射到类里的具体方法。
+
+## [tool] exec_command
+- Call ID: `call_EIBZyBcMUVeoJLLarDrzR6ML`
+- Timestamp: `2026-04-14 23:35:41`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '1,430p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 14000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_Bw7sBOv2mwWX1Yo8ynIzNyH4`
+- Timestamp: `2026-04-14 23:35:41`
+
+### Arguments
+```json
+{
+  "cmd": "rg -n \"def register_schedule|def q_mean_variance|def predict_start_from_noise|def q_posterior|def p_mean_variance|def p_sample|def p_sample_loop|def q_sample|def get_loss|def p_losses|def training_step|def validation_step|def configure_optimizers|class DDPM\" ldm/models/diffusion/ddpm.py",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 6000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_EIBZyBcMUVeoJLLarDrzR6ML`
+- Timestamp: `2026-04-14 23:35:41`
+
+### Output
+```
+Chunk ID: 33a588
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 5448
+Output:
+     1	"""
+     2	wild mixture of
+     3	https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
+     4	https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bbbd2d9902ce/improved_diffusion/gaussian_diffusion.py
+     5	https://github.com/CompVis/taming-transformers
+     6	-- merci
+     7	"""
+     8	
+     9	import torch
+    10	import torch.nn as nn
+    11	import numpy as np
+    12	import pytorch_lightning as pl
+    13	from torch.optim.lr_scheduler import LambdaLR
+    14	from einops import rearrange, repeat
+    15	from contextlib import contextmanager
+    16	from functools import partial
+    17	from tqdm import tqdm
+    18	from torchvision.utils import make_grid
+    19	from pytorch_lightning.utilities.distributed import rank_zero_only
+    20	
+    21	from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
+    22	from ldm.modules.ema import LitEma
+    23	from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
+    24	from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
+    25	from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+    26	from ldm.models.diffusion.ddim import DDIMSampler
+    27	
+    28	
+    29	__conditioning_keys__ = {'concat': 'c_concat',
+    30	                         'crossattn': 'c_crossattn',
+    31	                         'adm': 'y'}
+    32	
+    33	
+    34	def disabled_train(self, mode=True):
+    35	    """Overwrite model.train with this function to make sure train/eval mode
+    36	    does not change anymore."""
+    37	    return self
+    38	
+    39	
+    40	def uniform_on_device(r1, r2, shape, device):
+    41	    return (r1 - r2) * torch.rand(*shape, device=device) + r2
+    42	
+    43	
+    44	class DDPM(pl.LightningModule):
+    45	    # classic DDPM with Gaussian diffusion, in image space
+    46	    def __init__(self,
+    47	                 unet_config,
+    48	                 timesteps=1000,
+    49	                 beta_schedule="linear",
+    50	                 loss_type="l2",
+    51	                 ckpt_path=None,
+    52	                 ignore_keys=[],
+    53	                 load_only_unet=False,
+    54	                 monitor="val/loss",
+    55	                 use_ema=True,
+    56	                 first_stage_key="image",
+    57	                 image_size=256,
+    58	                 channels=3,
+    59	                 log_every_t=100,
+    60	                 clip_denoised=True,
+    61	                 linear_start=1e-4,
+    62	                 linear_end=2e-2,
+    63	                 cosine_s=8e-3,
+    64	                 given_betas=None,
+    65	                 original_elbo_weight=0.,
+    66	                 v_posterior=0.,  # weight for choosing posterior variance as sigma = (1-v) * beta_tilde + v * beta
+    67	                 l_simple_weight=1.,
+    68	                 conditioning_key=None,
+    69	                 parameterization="eps",  # all assuming fixed variance schedules
+    70	                 scheduler_config=None,
+    71	                 use_positional_encodings=False,
+    72	                 learn_logvar=False,
+    73	                 logvar_init=0.,
+    74	                 ):
+    75	        super().__init__()
+    76	        assert parameterization in ["eps", "x0"], 'currently only supporting "eps" and "x0"'
+    77	        self.parameterization = parameterization
+    78	        print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
+    79	        self.cond_stage_model = None
+    80	        self.clip_denoised = clip_denoised
+    81	        self.log_every_t = log_every_t
+    82	        self.first_stage_key = first_stage_key
+    83	        self.image_size = image_size  # try conv?
+    84	        self.channels = channels
+    85	        self.use_positional_encodings = use_positional_encodings
+    86	        self.model = DiffusionWrapper(unet_config, conditioning_key)
+    87	        count_params(self.model, verbose=True)
+    88	        self.use_ema = use_ema
+    89	        if self.use_ema:
+    90	            self.model_ema = LitEma(self.model)
+    91	            print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+    92	
+    93	        self.use_scheduler = scheduler_config is not None
+    94	        if self.use_scheduler:
+    95	            self.scheduler_config = scheduler_config
+    96	
+    97	        self.v_posterior = v_posterior
+    98	        self.original_elbo_weight = original_elbo_weight
+    99	        self.l_simple_weight = l_simple_weight
+   100	
+   101	        if monitor is not None:
+   102	            self.monitor = monitor
+   103	        if ckpt_path is not None:
+   104	            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys, only_model=load_only_unet)
+   105	
+   106	        self.register_schedule(given_betas=given_betas, beta_schedule=beta_schedule, timesteps=timesteps,
+   107	                               linear_start=linear_start, linear_end=linear_end, cosine_s=cosine_s)
+   108	
+   109	        self.loss_type = loss_type
+   110	
+   111	        self.learn_logvar = learn_logvar
+   112	        self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
+   113	        if self.learn_logvar:
+   114	            self.logvar = nn.Parameter(self.logvar, requires_grad=True)
+   115	
+   116	
+   117	    def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
+   118	                          linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
+   119	        if exists(given_betas):
+   120	            betas = given_betas
+   121	        else:
+   122	            betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,
+   123	                                       cosine_s=cosine_s)
+   124	        alphas = 1. - betas
+   125	        alphas_cumprod = np.cumprod(alphas, axis=0)
+   126	        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+   127	
+   128	        timesteps, = betas.shape
+   129	        self.num_timesteps = int(timesteps)
+   130	        self.linear_start = linear_start
+   131	        self.linear_end = linear_end
+   132	        assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
+   133	
+   134	        to_torch = partial(torch.tensor, dtype=torch.float32)
+   135	
+   136	        self.register_buffer('betas', to_torch(betas))
+   137	        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+   138	        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+   139	
+   140	        # calculations for diffusion q(x_t | x_{t-1}) and others
+   141	        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+   142	        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
+   143	        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
+   144	        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
+   145	        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+   146	
+   147	        # calculations for posterior q(x_{t-1} | x_t, x_0)
+   148	        posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
+   149	                    1. - alphas_cumprod) + self.v_posterior * betas
+   150	        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+   151	        self.register_buffer('posterior_variance', to_torch(posterior_variance))
+   152	        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+   153	        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+   154	        self.register_buffer('posterior_mean_coef1', to_torch(
+   155	            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
+   156	        self.register_buffer('posterior_mean_coef2', to_torch(
+   157	            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+   158	
+   159	        if self.parameterization == "eps":
+   160	            lvlb_weights = self.betas ** 2 / (
+   161	                        2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+   162	        elif self.parameterization == "x0":
+   163	            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+   164	        else:
+   165	            raise NotImplementedError("mu not supported")
+   166	        # TODO how to choose this term
+   167	        lvlb_weights[0] = lvlb_weights[1]
+   168	        self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
+   169	        assert not torch.isnan(self.lvlb_weights).all()
+   170	
+   171	    @contextmanager
+   172	    def ema_scope(self, context=None):
+   173	        if self.use_ema:
+   174	            self.model_ema.store(self.model.parameters())
+   175	            self.model_ema.copy_to(self.model)
+   176	            if context is not None:
+   177	                print(f"{context}: Switched to EMA weights")
+   178	        try:
+   179	            yield None
+   180	        finally:
+   181	            if self.use_ema:
+   182	                self.model_ema.restore(self.model.parameters())
+   183	                if context is not None:
+   184	                    print(f"{context}: Restored training weights")
+   185	
+   186	    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+   187	        sd = torch.load(path, map_location="cpu")
+   188	        if "state_dict" in list(sd.keys()):
+   189	            sd = sd["state_dict"]
+   190	        keys = list(sd.keys())
+   191	        for k in keys:
+   192	            for ik in ignore_keys:
+   193	                if k.startswith(ik):
+   194	                    print("Deleting key {} from state_dict.".format(k))
+   195	                    del sd[k]
+   196	        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+   197	            sd, strict=False)
+   198	        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+   199	        if len(missing) > 0:
+   200	            print(f"Missing Keys: {missing}")
+   201	        if len(unexpected) > 0:
+   202	            print(f"Unexpected Keys: {unexpected}")
+   203	
+   204	    def q_mean_variance(self, x_start, t):
+   205	        """
+   206	        Get the distribution q(x_t | x_0).
+   207	        :param x_start: the [N x C x ...] tensor of noiseless inputs.
+   208	        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+   209	        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+   210	        """
+   211	        mean = (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start)
+   212	        variance = extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
+   213	        log_variance = extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+   214	        return mean, variance, log_variance
+   215	
+   216	    def predict_start_from_noise(self, x_t, t, noise):
+   217	        return (
+   218	                extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+   219	                extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+   220	        )
+   221	
+   222	    def q_posterior(self, x_start, x_t, t):
+   223	        posterior_mean = (
+   224	                extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+   225	                extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+   226	        )
+   227	        posterior_variance = extract_into_tensor(self.posterior_variance, t, x_t.shape)
+   228	        posterior_log_variance_clipped = extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
+   229	        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+   230	
+   231	    def p_mean_variance(self, x, t, clip_denoised: bool):
+   232	        model_out = self.model(x, t)
+   233	        if self.parameterization == "eps":
+   234	            x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
+   235	        elif self.parameterization == "x0":
+   236	            x_recon = model_out
+   237	        if clip_denoised:
+   238	            x_recon.clamp_(-1., 1.)
+   239	
+   240	        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+   241	        return model_mean, posterior_variance, posterior_log_variance
+   242	
+   243	    @torch.no_grad()
+   244	    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
+   245	        b, *_, device = *x.shape, x.device
+   246	        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+   247	        noise = noise_like(x.shape, device, repeat_noise)
+   248	        # no noise when t == 0
+   249	        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+   250	        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+   251	
+   252	    @torch.no_grad()
+   253	    def p_sample_loop(self, shape, return_intermediates=False):
+   254	        device = self.betas.device
+   255	        b = shape[0]
+   256	        img = torch.randn(shape, device=device)
+   257	        intermediates = [img]
+   258	        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling t', total=self.num_timesteps):
+   259	            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long),
+   260	                                clip_denoised=self.clip_denoised)
+   261	            if i % self.log_every_t == 0 or i == self.num_timesteps - 1:
+   262	                intermediates.append(img)
+   263	        if return_intermediates:
+   264	            return img, intermediates
+   265	        return img
+   266	
+   267	    @torch.no_grad()
+   268	    def sample(self, batch_size=16, return_intermediates=False):
+   269	        image_size = self.image_size
+   270	        channels = self.channels
+   271	        return self.p_sample_loop((batch_size, channels, image_size, image_size),
+   272	                                  return_intermediates=return_intermediates)
+   273	
+   274	    def q_sample(self, x_start, t, noise=None):
+   275	        noise = default(noise, lambda: torch.randn_like(x_start))
+   276	        return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+   277	                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
+   278	
+   279	    def get_loss(self, pred, target, mean=True):
+   280	        if self.loss_type == 'l1':
+   281	            loss = (target - pred).abs()
+   282	            if mean:
+   283	                loss = loss.mean()
+   284	        elif self.loss_type == 'l2':
+   285	            if mean:
+   286	                loss = torch.nn.functional.mse_loss(target, pred)
+   287	            else:
+   288	                loss = torch.nn.functional.mse_loss(target, pred, reduction='none')
+   289	        else:
+   290	            raise NotImplementedError("unknown loss type '{loss_type}'")
+   291	
+   292	        return loss
+   293	
+   294	    def p_losses(self, x_start, t, noise=None):
+   295	        noise = default(noise, lambda: torch.randn_like(x_start))
+   296	        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+   297	        model_out = self.model(x_noisy, t)
+   298	
+   299	        loss_dict = {}
+   300	        if self.parameterization == "eps":
+   301	            target = noise
+   302	        elif self.parameterization == "x0":
+   303	            target = x_start
+   304	        else:
+   305	            raise NotImplementedError(f"Paramterization {self.parameterization} not yet supported")
+   306	
+   307	        loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+   308	
+   309	        log_prefix = 'train' if self.training else 'val'
+   310	
+   311	        loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+   312	        loss_simple = loss.mean() * self.l_simple_weight
+   313	
+   314	        loss_vlb = (self.lvlb_weights[t] * loss).mean()
+   315	        loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
+   316	
+   317	        loss = loss_simple + self.original_elbo_weight * loss_vlb
+   318	
+   319	        loss_dict.update({f'{log_prefix}/loss': loss})
+   320	
+   321	        return loss, loss_dict
+   322	
+   323	    def forward(self, x, *args, **kwargs):
+   324	        # b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+   325	        # assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+   326	        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+   327	        return self.p_losses(x, t, *args, **kwargs)
+   328	
+   329	    def get_input(self, batch, k):
+   330	        x = batch[k]
+   331	        if len(x.shape) == 3:
+   332	            x = x[..., None]
+   333	        x = rearrange(x, 'b h w c -> b c h w')
+   334	        x = x.to(memory_format=torch.contiguous_format).float()
+   335	        return x
+   336	
+   337	    def shared_step(self, batch):
+   338	        x = self.get_input(batch, self.first_stage_key)
+   339	        loss, loss_dict = self(x)
+   340	        return loss, loss_dict
+   341	
+   342	    def training_step(self, batch, batch_idx):
+   343	        loss, loss_dict = self.shared_step(batch)
+   344	
+   345	        self.log_dict(loss_dict, prog_bar=True,
+   346	                      logger=True, on_step=True, on_epoch=True)
+   347	
+   348	        self.log("global_step", self.global_step,
+   349	                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
+   350	
+   351	        if self.use_scheduler:
+   352	            lr = self.optimizers().param_groups[0]['lr']
+   353	            self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+   354	
+   355	        return loss
+   356	
+   357	    @torch.no_grad()
+   358	    def validation_step(self, batch, batch_idx):
+   359	        _, loss_dict_no_ema = self.shared_step(batch)
+   360	        with self.ema_scope():
+   361	            _, loss_dict_ema = self.shared_step(batch)
+   362	            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+   363	        self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+   364	        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+   365	
+   366	    def on_train_batch_end(self, *args, **kwargs):
+   367	        if self.use_ema:
+   368	            self.model_ema(self.model)
+   369	
+   370	    def _get_rows_from_list(self, samples):
+   371	        n_imgs_per_row = len(samples)
+   372	        denoise_grid = rearrange(samples, 'n b c h w -> b n c h w')
+   373	        denoise_grid = rearrange(denoise_grid, 'b n c h w -> (b n) c h w')
+   374	        denoise_grid = make_grid(denoise_grid, nrow=n_imgs_per_row)
+   375	        return denoise_grid
+   376	
+   377	    @torch.no_grad()
+   378	    def log_images(self, batch, N=8, n_row=2, sample=True, return_keys=None, **kwargs):
+   379	        log = dict()
+   380	        x = self.get_input(batch, self.first_stage_key)
+   381	        N = min(x.shape[0], N)
+   382	        n_row = min(x.shape[0], n_row)
+   383	        x = x.to(self.device)[:N]
+   384	        log["inputs"] = x
+   385	
+   386	        # get diffusion row
+   387	        diffusion_row = list()
+   388	        x_start = x[:n_row]
+   389	
+   390	        for t in range(self.num_timesteps):
+   391	            if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+   392	                t = repeat(torch.tensor([t]), '1 -> b', b=n_row)
+   393	                t = t.to(self.device).long()
+   394	                noise = torch.randn_like(x_start)
+   395	                x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+   396	                diffusion_row.append(x_noisy)
+   397	
+   398	        log["diffusion_row"] = self._get_rows_from_list(diffusion_row)
+   399	
+   400	        if sample:
+   401	            # get denoise row
+   402	            with self.ema_scope("Plotting"):
+   403	                samples, denoise_row = self.sample(batch_size=N, return_intermediates=True)
+   404	
+   405	            log["samples"] = samples
+   406	            log["denoise_row"] = self._get_rows_from_list(denoise_row)
+   407	
+   408	        if return_keys:
+   409	            if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:
+   410	                return log
+   411	            else:
+   412	                return {key: log[key] for key in return_keys}
+   413	        return log
+   414	
+   415	    def configure_optimizers(self):
+   416	        lr = self.learning_rate
+   417	        params = list(self.model.parameters())
+   418	        if self.learn_logvar:
+   419	            params = params + [self.logvar]
+   420	        opt = torch.optim.AdamW(params, lr=lr)
+   421	        return opt
+   422	
+   423	
+   424	class LatentDiffusion(DDPM):
+   425	    """main class"""
+   426	    def __init__(self,
+   427	                 first_stage_config,
+   428	                 cond_stage_config,
+   429	                 num_timesteps_cond=None,
+   430	                 cond_stage_key="image",
+
+```
+
+### Output
+```
+Chunk ID: 13a021
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 299
+Output:
+44:class DDPM(pl.LightningModule):
+117:    def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
+204:    def q_mean_variance(self, x_start, t):
+216:    def predict_start_from_noise(self, x_t, t, noise):
+222:    def q_posterior(self, x_start, x_t, t):
+231:    def p_mean_variance(self, x, t, clip_denoised: bool):
+244:    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
+253:    def p_sample_loop(self, shape, return_intermediates=False):
+274:    def q_sample(self, x_start, t, noise=None):
+279:    def get_loss(self, pred, target, mean=True):
+294:    def p_losses(self, x_start, t, noise=None):
+342:    def training_step(self, batch, batch_idx):
+358:    def validation_step(self, batch, batch_idx):
+415:    def configure_optimizers(self):
+493:    def register_schedule(self,
+1012:    def p_losses(self, x_start, cond, t, noise=None):
+1047:    def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
+1079:    def p_sample(self, x, c, t, clip_denoised=False, repeat_noise=False,
+1166:    def p_sample_loop(self, cond, shape, return_intermediates=False,
+1361:    def configure_optimizers(self):
+
+```
+
+## [#54] Assistant
+- Timestamp: `2026-04-14 23:37:51`
+
+**先给结论**
+
+这个 [`DDPM`](<PATH>) 类实现的是一个“经典高斯扩散模型”的基类，和 Ho et al. 的 DDPM 论文主线是对齐的：
+
+1. 定义前向加噪过程 `q(x_t | x_{t-1})`
+2. 用闭式公式直接采样 `q(x_t | x_0)`
+3. 训练一个网络预测噪声 `\epsilon`
+4. 用预测出的 `\hat{x}_0` 构造反向分布 `p_\theta(x_{t-1}|x_t)`
+5. 逐步采样回到 `x_0`
+
+但这个类也混入了 **Improved DDPM** 风格的一些扩展，比如：
+
+- `parameterization="x0"` 选项
+- `learn_logvar`
+- `v_posterior`
+- `original_elbo_weight`
+
+代码开头自己也写了它是混合实现：
+[ddpm.py#L1](<PATH>)
+
+---
+
+**参考来源**
+
+我下面的公式对照主要基于这些一手来源：
+
+- DDPM 论文：Ho et al., *Denoising Diffusion Probabilistic Models*
+  https://arxiv.org/abs/2006.11239
+
+- Improved DDPM：Nichol, Dhariwal, *Improved Denoising Diffusion Probabilistic Models*
+  https://arxiv.org/abs/2102.09672
+
+- OpenAI `improved-diffusion` 官方实现
+  https://github.com/openai/improved-diffusion
+
+---
+
+**1. 类的整体职责**
+
+初始化在：
+[ddpm.py#L46](<PATH>)
+
+这里做了几件核心事：
+
+- 创建去噪网络 `self.model`
+- 设置扩散超参数
+- 预计算前向扩散和后验分布的各种系数
+- 设置损失形式
+- 可选 EMA
+- 可选学习 log-variance
+
+注意这里的 `self.model` 不是裸 UNet，而是：
+
+[ddpm.py#L86](<PATH>)
+
+```python
+self.model = DiffusionWrapper(unet_config, conditioning_key)
+```
+
+对于基础 `DDPM` 来说，通常是无条件的；在 Stable Diffusion 真正用的是它的子类 `LatentDiffusion`。
+
+---
+
+**2. 论文里的前向扩散公式，对应哪段代码**
+
+DDPM 论文定义前向马尔可夫链：
+
+\[
+q(x_t \mid x_{t-1}) = \mathcal{N}\left(x_t; \sqrt{1-\beta_t}x_{t-1}, \beta_t I\right)
+\]
+
+定义：
+
+\[
+\alpha_t = 1 - \beta_t,\qquad \bar{\alpha}_t = \prod_{s=1}^t \alpha_s
+\]
+
+于是可得闭式：
+
+\[
+q(x_t \mid x_0) = \mathcal{N}\left(x_t; \sqrt{\bar{\alpha}_t}x_0,\ (1-\bar{\alpha}_t)I\right)
+\]
+
+对应代码在：
+
+[ddpm.py#L117](<PATH>)
+
+```python
+betas = make_beta_schedule(...)
+alphas = 1. - betas
+alphas_cumprod = np.cumprod(alphas, axis=0)
+alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+```
+
+以及注册的 buffer：
+
+[ddpm.py#L141](<PATH>)
+
+```python
+self.register_buffer('sqrt_alphas_cumprod', ...)
+self.register_buffer('sqrt_one_minus_alphas_cumprod', ...)
+```
+
+它们正好就是闭式采样要用的系数。
+
+---
+
+**3. `q(x_t | x_0)` 在代码里怎么实现**
+
+方法在：
+
+[ddpm.py#L274](<PATH>)
+
+```python
+def q_sample(self, x_start, t, noise=None):
+    noise = default(noise, lambda: torch.randn_like(x_start))
+    return (
+        extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+        extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+    )
+```
+
+这和论文闭式公式一一对应：
+
+\[
+x_t = \sqrt{\bar{\alpha}_t}x_0 + \sqrt{1-\bar{\alpha}_t}\epsilon,\qquad \epsilon \sim \mathcal N(0,I)
+\]
+
+这里：
+
+- `x_start` 对应 \(x_0\)
+- `noise` 对应 \(\epsilon\)
+- `t` 是每个 batch sample 的时间步
+
+---
+
+**4. `q_mean_variance()` 对应什么公式**
+
+方法在：
+
+[ddpm.py#L204](<PATH>)
+
+```python
+mean = sqrt_alphas_cumprod[t] * x_start
+variance = 1.0 - alphas_cumprod[t]
+log_variance = log_one_minus_alphas_cumprod[t]
+```
+
+这对应的正是：
+
+\[
+q(x_t \mid x_0) = \mathcal{N}\left(
+\sqrt{\bar{\alpha}_t}x_0,\ (1-\bar{\alpha}_t)I
+\right)
+\]
+
+也就是说，这个函数返回的是：
+
+- 均值
+- 方差
+- 对数方差
+
+它没有真的采样，只是在返回这个分布本身。
+
+---
+
+**5. 反向后验 `q(x_{t-1}|x_t,x_0)` 怎么实现**
+
+DDPM 论文里有：
+
+\[
+q(x_{t-1}\mid x_t, x_0)=\mathcal N(x_{t-1}; \tilde{\mu}_t(x_t,x_0), \tilde{\beta}_t I)
+\]
+
+其中：
+
+\[
+\tilde{\mu}_t(x_t,x_0)=
+\frac{\sqrt{\bar{\alpha}_{t-1}}\beta_t}{1-\bar{\alpha}_t}x_0
++
+\frac{\sqrt{\alpha_t}(1-\bar{\alpha}_{t-1})}{1-\bar{\alpha}_t}x_t
+\]
+
+\[
+\tilde{\beta}_t = \frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}\beta_t
+\]
+
+对应代码在两处。
+
+先是预计算系数：
+
+[ddpm.py#L147](<PATH>)
+
+```python
+posterior_variance = ...
+posterior_mean_coef1 = ...
+posterior_mean_coef2 = ...
+```
+
+再是实际组装后验分布：
+
+[ddpm.py#L222](<PATH>)
+
+```python
+posterior_mean = (
+    coef1 * x_start + coef2 * x_t
+)
+posterior_variance = ...
+posterior_log_variance_clipped = ...
+```
+
+完全就是论文里的 \(\tilde{\mu}_t\) 和 \(\tilde{\beta}_t\)。
+
+---
+
+**6. `v_posterior` 是什么，为什么不像原论文**
+
+这个参数在：
+
+[ddpm.py#L66](<PATH>)
+
+```python
+v_posterior=0.
+```
+
+以及：
+
+[ddpm.py#L148](<PATH>)
+
+```python
+posterior_variance = (1 - self.v_posterior) * beta_tilde + self.v_posterior * beta_t
+```
+
+如果 `v_posterior = 0`，那就是标准 DDPM 的：
+
+\[
+\tilde{\beta}_t
+\]
+
+如果不为 0，就是在 \(\tilde{\beta}_t\) 和 \(\beta_t\) 之间做插值。
+这不是原始 DDPM 论文的最基础写法，更接近后续改进实现思路。我这里是在根据代码做推断。
+
+---
+
+**7. 训练时模型到底学什么**
+
+这个类支持两种参数化：
+
+[ddpm.py#L69](<PATH>)
+
+```python
+parameterization="eps"
+```
+
+- `"eps"`：预测噪声
+- `"x0"`：直接预测原图
+
+原始 DDPM 最经典的是预测噪声 \(\epsilon\)。
+
+训练目标是：
+
+\[
+L_{simple} =
+\mathbb E_{x_0,\epsilon,t}
+\left[
+\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\right]
+\]
+
+对应代码在：
+
+[ddpm.py#L294](<PATH>)
+
+```python
+x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+model_out = self.model(x_noisy, t)
+```
+
+如果是 `eps` 参数化：
+
+[ddpm.py#L300](<PATH>)
+
+```python
+target = noise
+```
+
+然后：
+
+[ddpm.py#L307](<PATH>)
+
+```python
+loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+```
+
+如果默认 `loss_type='l2'`，那就是 MSE，也就是论文里的简化目标。
+
+---
+
+**8. `forward()` 为什么只随机采样一个 `t`**
+
+在：
+
+[ddpm.py#L323](<PATH>)
+
+```python
+t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+return self.p_losses(x, t, *args, **kwargs)
+```
+
+DDPM 训练时并不是每次都跑完整 1000 步链路，而是：
+
+- 从 `t ~ Uniform({1,...,T})` 随机采一个时间步
+- 直接根据闭式公式构造 `x_t`
+- 训练模型在这个 `t` 上去噪
+
+这正是 DDPM 能高效训练的关键。
+
+---
+
+**9. 论文里从噪声恢复 `x_0` 的公式，对应什么实现**
+
+如果模型预测的是噪声 \(\epsilon_\theta(x_t,t)\)，那么可以反推出：
+
+\[
+\hat{x}_0 =
+\frac{1}{\sqrt{\bar{\alpha}_t}}
+\left(
+x_t - \sqrt{1-\bar{\alpha}_t}\,\epsilon_\theta(x_t,t)
+\right)
+\]
+
+代码对应：
+
+[ddpm.py#L216](<PATH>)
+
+```python
+def predict_start_from_noise(self, x_t, t, noise):
+    return (
+        sqrt_recip_alphas_cumprod * x_t -
+        sqrt_recipm1_alphas_cumprod * noise
+    )
+```
+
+这个函数非常重要，因为它把“网络输出噪声”转回“对原图的估计”。
+
+---
+
+**10. `p_mean_variance()` 就是论文里的 `p_\theta(x_{t-1}|x_t)`**
+
+DDPM 论文写：
+
+\[
+p_\theta(x_{t-1}\mid x_t)=
+\mathcal N(x_{t-1}; \mu_\theta(x_t,t), \Sigma_\theta(x_t,t))
+\]
+
+在这个实现里：
+
+1. 先用网络得到 `model_out`
+2. 如果是 `eps` 参数化，就先还原 \(\hat{x}_0\)
+3. 再把 \(\hat{x}_0\) 代入闭式后验公式，得到 \(\mu_\theta\)
+
+对应代码：
+
+[ddpm.py#L231](<PATH>)
+
+```python
+model_out = self.model(x, t)
+if self.parameterization == "eps":
+    x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
+...
+model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+    x_start=x_recon, x_t=x, t=t
+)
+```
+
+也就是说，这里采用的是 DDPM 常见套路：
+
+> 网络不直接输出 `\mu_\theta`，而是输出 `\epsilon_\theta`，再通过闭式公式构造出反向高斯分布的均值。
+
+---
+
+**11. 为什么要 `clip_denoised`**
+
+这段在：
+
+[ddpm.py#L237](<PATH>)
+
+```python
+if clip_denoised:
+    x_recon.clamp_(-1., 1.)
+```
+
+因为这个仓库默认图像张量范围是 `[-1,1]`。
+预测出来的 \(\hat{x}_0\) 如果跑飞，可能影响后验均值计算和采样稳定性，所以常做 clip。
+
+这更像工程稳定性技巧，不是 DDPM 核心理论公式本身。
+
+---
+
+**12. 单步反向采样 `p_sample()` 的数学含义**
+
+论文里反向采样是：
+
+\[
+x_{t-1} = \mu_\theta(x_t,t) + \sigma_t z,\qquad z\sim\mathcal N(0,I)
+\]
+
+代码：
+
+[ddpm.py#L243](<PATH>)
+
+```python
+model_mean, _, model_log_variance = self.p_mean_variance(...)
+noise = noise_like(x.shape, device, repeat_noise)
+nonzero_mask = (1 - (t == 0).float()).reshape(...)
+return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+```
+
+这对应：
+
+\[
+x_{t-1} =
+\mu_\theta(x_t,t)
++
+\mathbf{1}_{t>0}\sigma_t z
+\]
+
+其中 `nonzero_mask` 的作用就是：
+
+- 当 `t=0` 时，不再加噪声
+- 直接返回最终结果
+
+---
+
+**13. 完整采样循环 `p_sample_loop()`**
+
+代码：
+
+[ddpm.py#L253](<PATH>)
+
+```python
+img = torch.randn(shape, device=device)
+for i in reversed(range(0, self.num_timesteps)):
+    img = self.p_sample(img, t=i)
+```
+
+这就是论文里的完整反向链：
+
+\[
+x_T \sim \mathcal N(0,I)
+\]
+
+然后依次采样：
+
+\[
+x_T \to x_{T-1} \to \cdots \to x_0
+\]
+
+---
+
+**14. `register_schedule()` 为什么这么多 buffer**
+
+这是这个类最“数学化”的地方。
+
+它预先算好了所有时间步都要用的量：
+
+- `betas`
+- `alphas_cumprod`
+- `sqrt_alphas_cumprod`
+- `sqrt_one_minus_alphas_cumprod`
+- `posterior_mean_coef1`
+- `posterior_mean_coef2`
+- `posterior_variance`
+
+这样训练和采样时就不需要每次重新推公式，只需要按 `t` 索引。
+
+这个索引过程由：
+
+`extract_into_tensor(...)`
+
+完成，它会把一维 schedule 按当前 batch 的 `t` 拉成和图像 shape 对齐的 tensor。
+
+---
+
+**15. `lvlb_weights` 和 `original_elbo_weight` 是在干什么**
+
+这段在：
+
+[ddpm.py#L159](<PATH>)
+
+```python
+lvlb_weights = ...
+```
+
+以及训练里：
+
+[ddpm.py#L314](<PATH>)
+
+```python
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+```
+
+原始 DDPM 论文里既讲了变分下界，也讲了简化噪声预测目标。
+工程上经常主要用：
+
+\[
+L_{simple}
+\]
+
+同时给一点点加权的 VLB 项。
+
+这里默认：
+
+[ddpm.py#L65](<PATH>)
+
+```python
+original_elbo_weight=0.
+```
+
+所以默认几乎就是纯 simplified objective。
+这和实际很多 DDPM/LDM 训练实践是一致的。
+
+---
+
+**16. `get_loss()` 为什么默认是 `l2`**
+
+代码：
+
+[ddpm.py#L279](<PATH>)
+
+```python
+if self.loss_type == 'l2':
+    loss = mse_loss(...)
+```
+
+因为 DDPM 里最经典的 simplified objective 就是噪声预测的 MSE：
+
+\[
+\|\epsilon - \epsilon_\theta(x_t,t)\|_2^2
+\]
+
+如果改成 `l1` 也是支持的，但主流设置还是 `l2`。
+
+---
+
+**17. 训练流程在 Lightning 里怎么挂起来**
+
+训练入口：
+
+[ddpm.py#L342](<PATH>)
+
+```python
+loss, loss_dict = self.shared_step(batch)
+```
+
+`shared_step()` 做：
+
+[ddpm.py#L337](<PATH>)
+
+```python
+x = self.get_input(batch, self.first_stage_key)
+loss, loss_dict = self(x)
+```
+
+而 `self(x)` 又会走：
+
+[ddpm.py#L323](<PATH>)
+
+```python
+t = torch.randint(...)
+return self.p_losses(x, t)
+```
+
+所以完整训练链是：
+
+```text
+batch -> x0
+     -> sample t
+     -> sample eps
+     -> q_sample(x0, t, eps) 得到 xt
+     -> UNet(xt, t)
+     -> 预测 eps 或 x0
+     -> 计算 loss
+```
+
+---
+
+**18. EMA 是做什么的**
+
+这不是论文核心公式，但在训练实践里很重要。
+
+代码：
+
+[ddpm.py#L88](<PATH>)
+
+```python
+self.model_ema = LitEma(self.model)
+```
+
+验证 / 采样时会切到 EMA 权重：
+
+[ddpm.py#L171](<PATH>)
+
+很多 diffusion 实现都发现：
+
+- 训练权重波动更大
+- EMA 权重采样质量通常更稳定
+
+这属于工程增强，不是 DDPM 基础推导的一部分。
+
+---
+
+**19. 这个类和原始 DDPM 论文相比，哪些地方是“扩展版”**
+
+严格对照 DDPM 原论文，这个类有几处超出原始最简形式：
+
+1. `parameterization="x0"`
+   原始最经典是 `eps` 参数化，这里额外支持直接预测 `x0`
+
+2. `learn_logvar`
+   可学习时间步方差，更接近 Improved DDPM
+
+3. `v_posterior`
+   对后验方差做插值，不是最原始 DDPM 必要项
+
+4. `conditioning_key`
+   通过 `DiffusionWrapper` 支持条件扩散，这不是基础无条件 DDPM 本身
+
+5. `LatentDiffusion`
+   真正 Stable Diffusion 用的是它的子类，把像素空间 `x` 换成 latent `z`
+
+所以这个 `DDPM` 类更准确地说是：
+
+> 一个以经典 DDPM 公式为骨架、吸收了 improved-diffusion 工程实践的扩展基类
+
+---
+
+**20. 如果把整套公式和代码一一压缩成映射表**
+
+- 前向一步加噪
+  \[
+  q(x_t|x_{t-1})=\mathcal N(\sqrt{1-\beta_t}x_{t-1},\beta_t I)
+  \]
+  对应 schedule 定义
+  [ddpm.py#L117](<PATH>)
+
+- 闭式前向采样
+  \[
+  x_t=\sqrt{\bar{\alpha}_t}x_0+\sqrt{1-\bar{\alpha}_t}\epsilon
+  \]
+  对应
+  [ddpm.py#L274](<PATH>)
+
+- 反推原图
+  \[
+  \hat{x}_0=\frac{1}{\sqrt{\bar{\alpha}_t}}\left(x_t-\sqrt{1-\bar{\alpha}_t}\epsilon_\theta\right)
+  \]
+  对应
+  [ddpm.py#L216](<PATH>)
+
+- 后验分布
+  \[
+  q(x_{t-1}|x_t,x_0)=\mathcal N(\tilde{\mu}_t,\tilde{\beta}_t I)
+  \]
+  对应
+  [ddpm.py#L222](<PATH>)
+
+- 训练目标
+  \[
+  \mathbb E\|\epsilon-\epsilon_\theta(x_t,t)\|^2
+  \]
+  对应
+  [ddpm.py#L294](<PATH>)
+
+- 单步反向采样
+  \[
+  x_{t-1}=\mu_\theta(x_t,t)+\sigma_t z
+  \]
+  对应
+  [ddpm.py#L243](<PATH>)
+
+- 全链采样
+  \[
+  x_T \to x_{T-1} \to \cdots \to x_0
+  \]
+  对应
+  [ddpm.py#L253](<PATH>)
+
+---
+
+**一句话总结**
+
+这个 `DDPM` 类几乎就是把论文里的高斯扩散过程拆成了三部分：
+
+- `register_schedule()`：把论文里的 \(\beta_t,\alpha_t,\bar\alpha_t,\tilde\beta_t\) 全部预计算
+- `q_sample()` / `q_posterior()`：实现论文里的前向闭式与后验闭式
+- `p_losses()` / `p_sample()`：实现噪声预测训练目标和反向采样链
+
+而 Stable Diffusion 真正使用的 `LatentDiffusion`，就是在这个数学骨架上，把 `x` 从像素图像换成了 VAE latent。
+
+如果你愿意，我下一步可以继续做两种深入之一：
+
+1. 逐行讲 `LatentDiffusion` 是怎么在这个 `DDPM` 骨架上接入 VAE 和文本条件的
+2. 单独把 `register_schedule()` 里每个 buffer 的公式推导再展开一遍
+
+## [#55] User
+- Timestamp: `2026-04-14 23:53:21`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (line 126)
+
+## My request for Codex:
+这里为什么需要新增一个1在前面
+
+## [#56] Assistant
+- Timestamp: `2026-04-14 23:53:46`
+
+这里前面补一个 `1.`，是为了让 `alphas_cumprod_prev[t]` 表示 **\(\bar{\alpha}_{t-1}\)**，并且在 `t=0` 时也有一个合法值。
+
+位置在：
+[ddpm.py:126](<PATH>)
+
+```python
+alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+```
+
+---
+
+**先看 `alphas_cumprod` 是什么**
+
+前面有：
+
+[ddpm.py:124](<PATH>)
+
+```python
+alphas = 1. - betas
+alphas_cumprod = np.cumprod(alphas, axis=0)
+```
+
+所以：
+
+\[
+\alpha_t = 1-\beta_t
+\]
+
+\[
+\bar{\alpha}_t = \prod_{s=0}^{t}\alpha_s
+\]
+
+于是 `alphas_cumprod[t]` 对应的就是：
+
+\[
+\bar{\alpha}_t
+\]
+
+---
+
+**那 `alphas_cumprod_prev` 要表示什么**
+
+代码后面很多地方要用：
+
+\[
+\bar{\alpha}_{t-1}
+\]
+
+比如后验分布：
+
+\[
+q(x_{t-1}\mid x_t, x_0)
+\]
+
+的均值和方差公式里都需要 \(\bar{\alpha}_{t-1}\)。
+
+所以最自然的做法就是构造一个“整体右移一位”的数组：
+
+```python
+alphas_cumprod_prev[t] = alphas_cumprod[t-1]
+```
+
+但这里有个边界问题：
+
+- 当 `t=0` 时，需要的是“前一个”的值
+- 可是 `t=-1` 在数学上并不是我们真正想表达的东西
+
+所以要手工定义：
+
+\[
+\bar{\alpha}_{-1} \equiv 1
+\]
+
+更准确地说，在实现里把“第 0 步之前的累计乘积”定义成 1。
+
+---
+
+**为什么定义成 1 是合理的**
+
+因为累计乘积在空积情况下就是 1：
+
+\[
+\prod_{s=0}^{-1}\alpha_s = 1
+\]
+
+这和数学里的空乘积定义一致。
+
+直觉上也合理：
+
+- 在扩散开始前，还没有乘过任何 \(\alpha\)
+- 所以累计缩放因子应该是 1
+- 也就是“原图还没被衰减”
+
+---
+
+**举个简单例子**
+
+假设：
+
+```python
+alphas = [0.9, 0.8, 0.7]
+```
+
+那么：
+
+```python
+alphas_cumprod = [0.9, 0.72, 0.504]
+```
+
+对应：
+
+- \(\bar{\alpha}_0 = 0.9\)
+- \(\bar{\alpha}_1 = 0.9 \times 0.8 = 0.72\)
+- \(\bar{\alpha}_2 = 0.9 \times 0.8 \times 0.7 = 0.504\)
+
+然后：
+
+```python
+alphas_cumprod_prev = [1.0, 0.9, 0.72]
+```
+
+这样就有：
+
+- `alphas_cumprod_prev[0] = 1.0`
+- `alphas_cumprod_prev[1] = 0.9 = \bar{\alpha}_0`
+- `alphas_cumprod_prev[2] = 0.72 = \bar{\alpha}_1`
+
+完全符合“prev”这个名字的语义。
+
+---
+
+**它后面具体用在哪**
+
+最直接就是这里：
+
+[ddpm.py:148](<PATH>)
+
+```python
+posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod) + ...
+```
+
+以及：
+
+[ddpm.py:154](<PATH>)
+
+```python
+posterior_mean_coef1 = betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)
+```
+
+[ddpm.py:156](<PATH>)
+
+```python
+posterior_mean_coef2 = (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)
+```
+
+这些都是 DDPM 后验公式里需要 \(\bar{\alpha}_{t-1}\) 的地方。
+
+如果不在前面补这个 `1.`：
+
+- 数组长度会对不上
+- `t=0` 的边界会不好处理
+- 后验公式实现会更别扭
+
+---
+
+**一句话总结**
+
+前面补一个 `1.`，是为了把 `alphas_cumprod_prev` 定义成“上一个时间步的累计乘积”，并让 `t=0` 时对应的“前一项”自然等于 1，也就是扩散开始前的空乘积。
+
+如果你愿意，我可以下一步继续把 `posterior_mean_coef1` 和 `posterior_mean_coef2` 这两个系数从 DDPM 论文公式一步一步推导给你看。
+
+## [#57] User (context)
+- Timestamp: `2026-04-15 00:17:39`
+
+<environment_context>
+  <shell>bash</shell>
+  <current_date>2026-04-15</current_date>
+  <timezone>Asia/Shanghai</timezone>
+</environment_context>
+
+## [#58] User
+- Timestamp: `2026-04-15 00:17:39`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+self.sqrt_alphas_cumprod
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- functools.py: <PATH>
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (line 276)
+
+## My request for Codex:
+这里为什么需要这样操作，extract_into_tensor这里面应该t索引的数量和self.sqrt_alphas_cumprod列表的数量是一样的把
+
+## [#59] Assistant
+- Timestamp: `2026-04-15 00:17:48`
+
+我先把 `extract_into_tensor` 这一个小工具和 `t` 的实际形状对起来讲，这里确实很容易把“时间步总数”和“当前 batch 里采样的 t”混成一回事。
+
+## [tool] exec_command
+- Call ID: `call_txrrkQoBqhIJfHFWOSgRW5K0`
+- Timestamp: `2026-04-15 00:17:48`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/util.py | sed -n '80,140p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 4000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_eQFsot7nYBoAgGqWRWihmtfX`
+- Timestamp: `2026-04-15 00:17:48`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '268,280p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_vN2Ae8VtSe2wPy5WgSb6cpXd`
+- Timestamp: `2026-04-15 00:17:48`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '323,328p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_txrrkQoBqhIJfHFWOSgRW5K0`
+- Timestamp: `2026-04-15 00:17:48`
+
+### Output
+```
+Chunk ID: 5af724
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 724
+Output:
+    80	    which defines the cumulative product of (1-beta) over time from t = [0,1].
+    81	    :param num_diffusion_timesteps: the number of betas to produce.
+    82	    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+    83	                      produces the cumulative product of (1-beta) up to that
+    84	                      part of the diffusion process.
+    85	    :param max_beta: the maximum beta to use; use values lower than 1 to
+    86	                     prevent singularities.
+    87	    """
+    88	    betas = []
+    89	    for i in range(num_diffusion_timesteps):
+    90	        t1 = i / num_diffusion_timesteps
+    91	        t2 = (i + 1) / num_diffusion_timesteps
+    92	        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    93	    return np.array(betas)
+    94	
+    95	
+    96	def extract_into_tensor(a, t, x_shape):
+    97	    b, *_ = t.shape
+    98	    out = a.gather(-1, t)
+    99	    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+   100	
+   101	
+   102	def checkpoint(func, inputs, params, flag):
+   103	    """
+   104	    Evaluate a function without caching intermediate activations, allowing for
+   105	    reduced memory at the expense of extra compute in the backward pass.
+   106	    :param func: the function to evaluate.
+   107	    :param inputs: the argument sequence to pass to `func`.
+   108	    :param params: a sequence of parameters `func` depends on but does not
+   109	                   explicitly take as arguments.
+   110	    :param flag: if False, disable gradient checkpointing.
+   111	    """
+   112	    if flag:
+   113	        args = tuple(inputs) + tuple(params)
+   114	        return CheckpointFunction.apply(func, len(inputs), *args)
+   115	    else:
+   116	        return func(*inputs)
+   117	
+   118	
+   119	class CheckpointFunction(torch.autograd.Function):
+   120	    @staticmethod
+   121	    def forward(ctx, run_function, length, *args):
+   122	        ctx.run_function = run_function
+   123	        ctx.input_tensors = list(args[:length])
+   124	        ctx.input_params = list(args[length:])
+   125	
+   126	        with torch.no_grad():
+   127	            output_tensors = ctx.run_function(*ctx.input_tensors)
+   128	        return output_tensors
+   129	
+   130	    @staticmethod
+   131	    def backward(ctx, *output_grads):
+   132	        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+   133	        with torch.enable_grad():
+   134	            # Fixes a bug where the first op in run_function modifies the
+   135	            # Tensor storage in place, which is not allowed for detach()'d
+   136	            # Tensors.
+   137	            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+   138	            output_tensors = ctx.run_function(*shallow_copies)
+   139	        input_grads = torch.autograd.grad(
+   140	            output_tensors,
+
+```
+
+## [tool output]
+- Call ID: `call_eQFsot7nYBoAgGqWRWihmtfX`
+- Timestamp: `2026-04-15 00:17:48`
+
+### Output
+```
+Chunk ID: 8c96e0
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 194
+Output:
+   268	    def sample(self, batch_size=16, return_intermediates=False):
+   269	        image_size = self.image_size
+   270	        channels = self.channels
+   271	        return self.p_sample_loop((batch_size, channels, image_size, image_size),
+   272	                                  return_intermediates=return_intermediates)
+   273	
+   274	    def q_sample(self, x_start, t, noise=None):
+   275	        noise = default(noise, lambda: torch.randn_like(x_start))
+   276	        return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+   277	                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
+   278	
+   279	    def get_loss(self, pred, target, mean=True):
+   280	        if self.loss_type == 'l1':
+
+```
+
+### Output
+```
+Chunk ID: eaf57f
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 102
+Output:
+   323	    def forward(self, x, *args, **kwargs):
+   324	        # b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+   325	        # assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+   326	        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+   327	        return self.p_losses(x, t, *args, **kwargs)
+   328	
+
+```
+
+## [#60] Assistant
+- Timestamp: `2026-04-15 00:18:17`
+
+不是的，这里 **`t` 的数量不等于 `self.sqrt_alphas_cumprod` 的长度**。
+
+这两个东西分别代表两种完全不同的维度：
+
+- `self.sqrt_alphas_cumprod`
+  是 **整个扩散过程所有时间步的系数表**
+- `t`
+  是 **当前这个 batch 里每个样本抽到的时间步索引**
+
+**先看两者的形状**
+
+`self.sqrt_alphas_cumprod` 来自整个 schedule：
+[ddpm.py:141](<PATH>)
+
+它的长度是：
+
+\[
+T = \text{num\_timesteps}
+\]
+
+比如默认就是 1000，所以形状大致是：
+
+```python
+self.sqrt_alphas_cumprod.shape == [1000]
+```
+
+而 `t` 是在训练时随机采的：
+
+[ddpm.py:326](<PATH>)
+
+```python
+t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+```
+
+所以如果 batch size 是 `B`，那么：
+
+```python
+t.shape == [B]
+```
+
+例如 batch size = 12 时，可能是：
+
+```python
+t = [23, 511, 7, 999, 402, ...]
+```
+
+所以：
+
+- `self.sqrt_alphas_cumprod` 长度是 1000
+- `t` 长度是 12
+
+显然不一样。
+
+---
+
+**`extract_into_tensor` 在做什么**
+
+定义在：
+[util.py:96](<PATH>)
+
+```python
+def extract_into_tensor(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+```
+
+分三步理解：
+
+### 1. 从整张时间表里按 `t` 取值
+
+```python
+out = a.gather(-1, t)
+```
+
+如果：
+
+```python
+a = self.sqrt_alphas_cumprod   # shape [1000]
+t = [23, 511, 7, 999]          # shape [4]
+```
+
+那得到：
+
+```python
+out = [a[23], a[511], a[7], a[999]]
+```
+
+也就是**给 batch 里的每个样本取出它自己那个时间步对应的系数**。
+
+### 2. reshape 成 `[B,1,1,1]`
+
+如果输入图像 `x_start.shape = [B, C, H, W]`，那：
+
+```python
+out.reshape(B, 1, 1, 1)
+```
+
+变成每个样本一个标量系数，但保留 batch 维。
+
+### 3. 利用广播乘到整张图上
+
+在这里用：
+
+[ddpm.py:276](<PATH>)
+
+```python
+extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+```
+
+于是每个样本都会乘上**属于自己那个时间步的系数**。
+
+---
+
+**为什么不能直接写成**
+
+```python
+self.sqrt_alphas_cumprod[t] * x_start
+```
+
+理论上很多情况下也能取值，但 `extract_into_tensor` 多做了两件关键事：
+
+1. **统一把结果 reshape 成可广播形状**
+   也就是 `[B,1,1,1]`
+
+2. **方便所有 schedule 系数都用同一套逻辑**
+   比如：
+   - `sqrt_alphas_cumprod`
+   - `sqrt_one_minus_alphas_cumprod`
+   - `posterior_variance`
+   - `posterior_mean_coef1`
+   - `posterior_mean_coef2`
+
+这是一种很常见的工程封装。
+
+---
+
+**为什么每个样本的 `t` 可以不一样**
+
+因为 DDPM 训练时通常是：
+
+\[
+t \sim \text{Uniform}\{0,1,\dots,T-1\}
+\]
+
+对 batch 中每个样本独立采样一个时间步。
+所以一个 batch 内部可能同时有：
+
+- 有的样本在 `t=5`
+- 有的样本在 `t=200`
+- 有的样本在 `t=900`
+
+这样训练更高效，不用每次只训练某一个固定步数。
+
+---
+
+**举个具体例子**
+
+假设：
+
+```python
+x_start.shape = [3, 4, 32, 32]
+t = [0, 10, 999]
+```
+
+那么：
+
+```python
+extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape)
+```
+
+返回形状：
+
+```python
+[3, 1, 1, 1]
+```
+
+内容大致是：
+
+```python
+[
+  [[[sqrt_alphas_cumprod[0]]]],
+  [[[sqrt_alphas_cumprod[10]]]],
+  [[[sqrt_alphas_cumprod[999]]]]
+]
+```
+
+然后和 `x_start` 相乘时自动广播成：
+
+```python
+[3, 4, 32, 32]
+```
+
+也就是：
+
+- 第 1 张图整体乘第 0 步系数
+- 第 2 张图整体乘第 10 步系数
+- 第 3 张图整体乘第 999 步系数
+
+---
+
+**一句话总结**
+
+这里之所以要 `extract_into_tensor(...)`，是因为：
+
+> `self.sqrt_alphas_cumprod` 是长度为 `T` 的整张时间步系数表，而 `t` 只是当前 batch 中每个样本选到的时间步索引；这个函数负责“按样本取对应系数，并 reshape 成可广播到整张特征图的形状”。
+
+如果你愿意，我下一步可以继续把这句完整展开：
+
+```python
+x_t = sqrt_alphas_cumprod[t] * x_0 + sqrt_one_minus_alphas_cumprod[t] * noise
+```
+
+我可以直接用一个 batch 的例子，把每个 tensor 的 shape 全部标出来。
+
+## [#61] User
+- Timestamp: `2026-04-15 00:30:05`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
+                    1. - alphas_cumprod) + self.v_posterior * betas
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- functools.py: <PATH>
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (lines 148-149)
+
+## My request for Codex:
+这段公式是在计算什么，怎么感觉没跟反向后验 对上
+
+## [#62] Assistant
+- Timestamp: `2026-04-15 00:30:43`
+
+你这个感觉是对的，因为这段代码不是在算“完整的反向后验分布”，而是在算：
+
+> **反向后验 \(q(x_{t-1}\mid x_t, x_0)\) 的方差项**
+> 更准确地说，是代码里实际采用的 `posterior_variance`
+
+位置在：
+[ddpm.py:148](<PATH>)
+
+```python
+posterior_variance = (1 - self.v_posterior) * betas * (1. - alphas_cumprod_prev) / (
+                    1. - alphas_cumprod) + self.v_posterior * betas
+```
+
+---
+
+**1. 先说标准 DDPM 论文里的后验**
+
+论文里，前向过程是：
+
+\[
+q(x_t \mid x_{t-1}) = \mathcal N(\sqrt{\alpha_t}x_{t-1}, (1-\alpha_t)I)
+\]
+
+通常记：
+
+\[
+\beta_t = 1-\alpha_t
+\]
+
+那么真实后验是：
+
+\[
+q(x_{t-1}\mid x_t, x_0) = \mathcal N(x_{t-1}; \tilde{\mu}_t(x_t,x_0), \tilde{\beta}_t I)
+\]
+
+其中方差项是：
+
+\[
+\tilde{\beta}_t
+=
+\frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}\beta_t
+\]
+
+---
+
+**2. 代码里的这段，如果 `v_posterior = 0`，就正好是标准后验方差**
+
+把代码抄出来：
+
+```python
+posterior_variance =
+(1 - v) * beta_t * (1 - alpha_bar_prev) / (1 - alpha_bar)
++ v * beta_t
+```
+
+如果：
+
+\[
+v = 0
+\]
+
+那就变成：
+
+\[
+posterior\_variance
+=
+\beta_t \frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}
+=
+\tilde{\beta}_t
+\]
+
+这就和论文里的后验方差**完全对上了**。
+
+也就是说：
+
+> 你看到的这段公式，本质上就是后验方差 \(\tilde{\beta}_t\) 的实现，只不过额外允许通过 `v_posterior` 做插值。
+
+---
+
+**3. 为什么你会觉得“没和反向后验对上”**
+
+因为后验分布是一个完整高斯：
+
+\[
+q(x_{t-1}\mid x_t, x_0) = \mathcal N(\tilde{\mu}_t, \tilde{\beta}_t I)
+\]
+
+它有两部分：
+
+1. **均值**
+   \[
+   \tilde{\mu}_t(x_t,x_0)
+   \]
+
+2. **方差**
+   \[
+   \tilde{\beta}_t
+   \]
+
+而你现在看的这段代码只是在算第 2 部分，也就是方差。
+
+均值是在下面单独算的：
+
+[ddpm.py:154](<PATH>)
+
+```python
+posterior_mean_coef1 = betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)
+posterior_mean_coef2 = (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)
+```
+
+后面组合成：
+
+[ddpm.py:223](<PATH>)
+
+```python
+posterior_mean = coef1 * x_start + coef2 * x_t
+```
+
+所以完整后验是拆开实现的：
+
+- 这段算 `variance`
+- 下面那两段算 `mean`
+
+---
+
+**4. 代码里的 `v_posterior` 是什么**
+
+这个参数在：
+[ddpm.py:66](<PATH>)
+
+```python
+v_posterior=0.
+```
+
+注释写的是：
+
+```python
+# weight for choosing posterior variance as sigma = (1-v) * beta_tilde + v * beta
+```
+
+也就是：
+
+\[
+\sigma_t^2 = (1-v)\tilde{\beta}_t + v\beta_t
+\]
+
+这不是最原始 DDPM 的唯一标准形式，而是一个扩展写法：
+
+- `v=0`：用标准后验方差 \(\tilde{\beta}_t\)
+- `v=1`：直接用 \(\beta_t\)
+- `0<v<1`：在两者之间插值
+
+所以你看到“好像不是论文里那条式子”，其实是因为代码给自己留了一个泛化接口。
+
+但默认值是：
+
+\[
+v = 0
+\]
+
+所以默认行为仍然就是论文里的标准后验方差。
+
+---
+
+**5. 为什么论文里会有 `\tilde{\beta}_t`，而不是直接 `\beta_t`**
+
+因为：
+
+- 前向一步噪声方差是 \(\beta_t\)
+- 但后验 \(q(x_{t-1}\mid x_t,x_0)\) 是条件在 `x_t` 和 `x_0` 上的高斯
+- 条件化后，它的方差会变成另一个量 \(\tilde{\beta}_t\)
+
+也就是说：
+
+\[
+\beta_t \neq \tilde{\beta}_t
+\]
+
+一般来说，\(\tilde{\beta}_t\) 是由贝叶斯推导出来的真实后验方差。
+
+---
+
+**6. 再把这段代码翻译成人话**
+
+```python
+posterior_variance =
+(1-v_posterior) * beta_tilde
++ v_posterior * beta_t
+```
+
+其中：
+
+```python
+beta_tilde = betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
+```
+
+意思就是：
+
+> 默认情况下，用 DDPM 论文推导出的真实后验方差；如果需要，也允许往原始前向噪声方差 `beta_t` 那边插值。
+
+---
+
+**7. 这段和完整后验公式怎么拼起来**
+
+完整后验在代码里其实是这三部分一起构成的：
+
+1. 方差
+   [ddpm.py:148](<PATH>)
+
+2. 均值系数 1
+   [ddpm.py:154](<PATH>)
+
+3. 均值系数 2
+   [ddpm.py:156](<PATH>)
+
+最后在：
+
+[ddpm.py:222](<PATH>)
+
+```python
+def q_posterior(self, x_start, x_t, t):
+```
+
+组合成真正的：
+
+\[
+q(x_{t-1}\mid x_t, x_0)
+\]
+
+---
+
+**8. 一句最直接的回答**
+
+这段公式是在计算 **反向后验 \(q(x_{t-1}\mid x_t,x_0)\) 的方差**，不是完整后验。
+你觉得它“没对上”是因为完整后验还包括均值项，而代码把均值和方差拆开实现了。并且这里还额外支持通过 `v_posterior` 在标准后验方差 \(\tilde{\beta}_t\) 和原始 \(\beta_t\) 之间插值。
+
+如果你愿意，我下一步可以直接把：
+
+- `posterior_mean_coef1`
+- `posterior_mean_coef2`
+
+这两个系数从论文公式一步一步推出来，正好把完整 `q_posterior()` 对齐完。
+
+## [#63] User
+- Timestamp: `2026-04-15 00:42:59`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+def log_images(self, batch, N=8, n_row=2, sample=True, return_keys=None, **kwargs):
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- functools.py: <PATH>
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (line 378)
+
+## My request for Codex:
+这个函数是用来干什么的
+
+## [#64] Assistant
+- Timestamp: `2026-04-15 00:43:25`
+
+这个 `log_images()` 不是训练核心公式的一部分，它的作用是：
+
+> **在训练/验证过程中，把输入图、加噪过程、采样结果这些可视化内容整理出来，交给 logger 或 callback 保存。**
+
+位置在：
+[ddpm.py:378](<PATH>)
+
+---
+
+**它主要服务谁**
+
+它主要是给 `main.py` 里的 `ImageLogger` callback 用的。
+
+在训练入口里有：
+
+[main.py:307](<PATH>)
+
+`ImageLogger.log_img(...)` 会检查模型有没有 `log_images` 方法，如果有就调用它，把返回的图像写到本地和日志系统里。
+
+所以这个函数本质上是：
+
+- 给训练时“看模型在干什么”用的
+- 方便调试和可视化
+- 不是前向训练必须调用的函数
+
+---
+
+**它会返回什么**
+
+返回一个 `dict`，里面可能包括：
+
+- `inputs`
+  原始输入图
+
+- `diffusion_row`
+  同一张图在不同时间步 `t` 下加噪后的样子
+
+- `samples`
+  从纯噪声采样出来的生成图
+
+- `denoise_row`
+  反向去噪过程中的中间结果拼图
+
+---
+
+**这个函数的执行流程**
+
+### 1. 取输入图
+
+[ddpm.py:380](<PATH>)
+
+```python
+x = self.get_input(batch, self.first_stage_key)
+```
+
+然后只取前 `N` 张做可视化：
+
+```python
+N = min(x.shape[0], N)
+```
+
+并保存：
+
+```python
+log["inputs"] = x
+```
+
+---
+
+### 2. 生成 `diffusion_row`
+
+这一段：
+
+[ddpm.py:386](<PATH>)
+
+```python
+diffusion_row = list()
+x_start = x[:n_row]
+for t in range(self.num_timesteps):
+    if t % self.log_every_t == 0 or t == self.num_timesteps - 1:
+        ...
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        diffusion_row.append(x_noisy)
+```
+
+它做的事是：
+
+- 拿几张真实图 `x_start`
+- 在不同时间步 `t` 上对它们加噪
+- 看图像如何从清晰逐渐变成纯噪声
+
+所以 `diffusion_row` 是**前向扩散过程可视化**。
+
+这很适合理解 DDPM 的 forward process。
+
+---
+
+### 3. 生成 `samples` 和 `denoise_row`
+
+如果 `sample=True`：
+
+[ddpm.py:400](<PATH>)
+
+```python
+with self.ema_scope("Plotting"):
+    samples, denoise_row = self.sample(batch_size=N, return_intermediates=True)
+```
+
+这里会：
+
+- 从纯高斯噪声开始采样
+- 用当前模型逐步反向去噪
+- 拿到最终生成结果 `samples`
+- 同时拿到中间去噪过程 `denoise_row`
+
+然后存进日志：
+
+```python
+log["samples"] = samples
+log["denoise_row"] = self._get_rows_from_list(denoise_row)
+```
+
+所以：
+
+- `samples` 是最终生成图
+- `denoise_row` 是“从噪声一步步变清晰”的过程图
+
+---
+
+**为什么这里用了 `ema_scope()`**
+
+因为通常 EMA 权重采样效果更稳定：
+
+[ddpm.py:402](<PATH>)
+
+```python
+with self.ema_scope("Plotting"):
+```
+
+也就是说，这个函数在做展示时，默认更偏向用“更平滑的权重版本”来出图。
+
+---
+
+**`return_keys` 是干什么的**
+
+最后这段：
+
+[ddpm.py:408](<PATH>)
+
+```python
+if return_keys:
+    ...
+```
+
+允许你只取某几个可视化结果，而不是全返回。
+
+比如只想看：
+
+- `inputs`
+- `samples`
+
+就可以只拿这两个键。
+
+---
+
+**一句话理解每个输出**
+
+- `inputs`
+  训练 batch 的真实图
+
+- `diffusion_row`
+  真实图在 forward diffusion 中逐渐被加噪的过程
+
+- `samples`
+  模型从纯噪声反向生成出来的图
+
+- `denoise_row`
+  反向采样时逐步去噪的过程可视化
+
+---
+
+**一句话总结**
+
+这个函数是一个**训练时可视化辅助函数**，用来把 DDPM 的：
+
+- 输入图
+- 前向加噪过程
+- 反向采样结果
+- 去噪中间过程
+
+整理成图像字典，供 logger/callback 保存和展示，方便观察模型训练状态。
+
+如果你愿意，我下一步可以直接把这个函数返回的每个 tensor 的 shape 也列出来，或者继续讲 `LatentDiffusion` 里重写后的 `log_images()` 为什么比这里复杂很多。
+
+## [#65] User
+- Timestamp: `2026-04-15 00:43:59`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+
+        log_prefix = 'train' if self.training else 'val'
+
+        loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+        loss_simple = loss.mean() * self.l_simple_weight
+
+        loss_vlb = (self.lvlb_weights[t] * loss).mean()
+        loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
+
+        loss = loss_simple + self.original_elbo_weight * loss_vlb
+
+        loss_dict.update({f'{log_prefix}/loss': loss})
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- functools.py: <PATH>
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+# Files mentioned by the user:
+
+## ddpm.py: <PATH> (lines 307-319)
+
+## My request for Codex:
+详解一下这一段loss计算代码，我看不止用了L2的loss
+
+## [#66] Assistant
+- Timestamp: `2026-04-15 00:44:09`
+
+我先把这段 loss 放回 `DDPM` 的训练目标里解释，重点区分 `loss_simple`、`loss_vlb` 和最终 `loss` 各自对应什么论文含义，以及默认配置下到底哪个真的在起作用。
+
+## [tool] exec_command
+- Call ID: `call_YPrIqNNu0KzM9eLGmQnsCG69`
+- Timestamp: `2026-04-15 00:44:09`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '294,320p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 3000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_wiMinJL73TE5P64EmBAdd6tM`
+- Timestamp: `2026-04-15 00:44:09`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '64,74p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 1500,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_3VjTnB1scrs2h2oQRTQMnGRo`
+- Timestamp: `2026-04-15 00:44:09`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '159,169p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_YPrIqNNu0KzM9eLGmQnsCG69`
+- Timestamp: `2026-04-15 00:44:09`
+
+### Output
+```
+Chunk ID: fae563
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 301
+Output:
+   294	    def p_losses(self, x_start, t, noise=None):
+   295	        noise = default(noise, lambda: torch.randn_like(x_start))
+   296	        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+   297	        model_out = self.model(x_noisy, t)
+   298	
+   299	        loss_dict = {}
+   300	        if self.parameterization == "eps":
+   301	            target = noise
+   302	        elif self.parameterization == "x0":
+   303	            target = x_start
+   304	        else:
+   305	            raise NotImplementedError(f"Paramterization {self.parameterization} not yet supported")
+   306	
+   307	        loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+   308	
+   309	        log_prefix = 'train' if self.training else 'val'
+   310	
+   311	        loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+   312	        loss_simple = loss.mean() * self.l_simple_weight
+   313	
+   314	        loss_vlb = (self.lvlb_weights[t] * loss).mean()
+   315	        loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
+   316	
+   317	        loss = loss_simple + self.original_elbo_weight * loss_vlb
+   318	
+   319	        loss_dict.update({f'{log_prefix}/loss': loss})
+   320	
+
+```
+
+## [tool output]
+- Call ID: `call_wiMinJL73TE5P64EmBAdd6tM`
+- Timestamp: `2026-04-15 00:44:09`
+
+### Output
+```
+Chunk ID: 0c89a7
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 152
+Output:
+    64	                 given_betas=None,
+    65	                 original_elbo_weight=0.,
+    66	                 v_posterior=0.,  # weight for choosing posterior variance as sigma = (1-v) * beta_tilde + v * beta
+    67	                 l_simple_weight=1.,
+    68	                 conditioning_key=None,
+    69	                 parameterization="eps",  # all assuming fixed variance schedules
+    70	                 scheduler_config=None,
+    71	                 use_positional_encodings=False,
+    72	                 learn_logvar=False,
+    73	                 logvar_init=0.,
+    74	                 ):
+
+```
+
+### Output
+```
+Chunk ID: 7931bd
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 178
+Output:
+   159	        if self.parameterization == "eps":
+   160	            lvlb_weights = self.betas ** 2 / (
+   161	                        2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+   162	        elif self.parameterization == "x0":
+   163	            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+   164	        else:
+   165	            raise NotImplementedError("mu not supported")
+   166	        # TODO how to choose this term
+   167	        lvlb_weights[0] = lvlb_weights[1]
+   168	        self.register_buffer('lvlb_weights', lvlb_weights, persistent=False)
+   169	        assert not torch.isnan(self.lvlb_weights).all()
+
+```
+
+## [#67] Assistant
+- Timestamp: `2026-04-15 00:45:00`
+
+对，这一段**不只是单纯一个 L2 loss**。更准确地说，它实现的是一种 **“simplified diffusion loss + 可选 VLB/ELBO 项”** 的组合。
+
+对应代码在：
+[ddpm.py:307](<PATH>)
+
+```python
+loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+
+log_prefix = 'train' if self.training else 'val'
+
+loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+loss_simple = loss.mean() * self.l_simple_weight
+
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+loss_dict.update({f'{log_prefix}/loss_vlb': loss_vlb})
+
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+
+loss_dict.update({f'{log_prefix}/loss': loss})
+```
+
+---
+
+**先把整段放回上下文**
+
+前面几行是：
+
+[ddpm.py:294](<PATH>)
+
+```python
+noise = default(noise, lambda: torch.randn_like(x_start))
+x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+model_out = self.model(x_noisy, t)
+```
+
+然后决定训练目标：
+
+[ddpm.py:300](<PATH>)
+
+```python
+if self.parameterization == "eps":
+    target = noise
+elif self.parameterization == "x0":
+    target = x_start
+```
+
+所以这段 loss 的本质是：
+
+- 如果模型预测噪声，就拿 `model_out` 和真实噪声 `noise` 比
+- 如果模型预测原图，就拿 `model_out` 和 `x_start` 比
+
+---
+
+# 1. 第一行 `loss = ...` 到底算的是什么
+
+[ddpm.py:307](<PATH>)
+
+```python
+loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
+```
+
+这里分两步。
+
+### 第一步：`self.get_loss(..., mean=False)`
+
+`get_loss()` 在这里：
+[ddpm.py:279](<PATH>)
+
+```python
+def get_loss(self, pred, target, mean=True):
+    if self.loss_type == 'l1':
+        ...
+    elif self.loss_type == 'l2':
+        ...
+```
+
+如果默认是 `l2`，那返回的是逐元素 MSE：
+
+\[
+(\text{pred} - \text{target})^2
+\]
+
+如果 `mean=False`，返回的 shape 还是：
+
+\[
+[B, C, H, W]
+\]
+
+也就是**每个像素、每个通道位置的误差图**。
+
+---
+
+### 第二步：`.mean(dim=[1,2,3])`
+
+把通道和空间维都平均掉，得到每个样本一个标量：
+
+\[
+L_i = \frac{1}{CHW}\sum_{c,h,w}(\text{pred}_{i,c,h,w}-\text{target}_{i,c,h,w})^2
+\]
+
+所以这时：
+
+```python
+loss.shape == [B]
+```
+
+它表示：
+
+> batch 里每张图在当前随机时间步 `t` 上的去噪误差
+
+---
+
+# 2. `loss_simple` 是什么
+
+[ddpm.py:311](<PATH>)
+
+```python
+loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+loss_simple = loss.mean() * self.l_simple_weight
+```
+
+这里 `loss.mean()` 是再把 batch 平均掉：
+
+\[
+L_{simple} = \frac{1}{B}\sum_{i=1}^B L_i
+\]
+
+如果当前是 `eps` 参数化，那它对应的就是 DDPM 最经典的 simplified objective：
+
+\[
+L_{simple}
+=
+\mathbb E_{x_0,\epsilon,t}
+\left[
+\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\right]
+\]
+
+这是 Ho et al. DDPM 论文里最常用、最经典的训练目标。
+
+这里的：
+
+```python
+self.l_simple_weight
+```
+
+是这个 simplified loss 的全局系数，默认是：
+
+[ddpm.py:67](<PATH>)
+
+```python
+l_simple_weight=1.
+```
+
+所以默认就是：
+
+\[
+loss\_simple = L_{simple}
+\]
+
+---
+
+# 3. `loss_vlb` 是什么
+
+[ddpm.py:314](<PATH>)
+
+```python
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+```
+
+这个就不是“纯 L2”了，它是在构造一个**和变分下界 VLB 相关的加权项**。
+
+---
+
+## 3.1 为什么要有 `lvlb_weights[t]`
+
+前面在 `register_schedule()` 里定义了：
+
+[ddpm.py:159](<PATH>)
+
+```python
+if self.parameterization == "eps":
+    lvlb_weights = self.betas ** 2 / (
+        2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+```
+
+这组权重和 DDPM / Improved DDPM 里把不同时间步的 KL 项改写成噪声预测误差后的系数有关。
+
+直觉上你可以理解成：
+
+> 不同时间步的误差，对完整变分下界的贡献不一样，所以要乘一个和 `t` 有关的权重。
+
+所以：
+
+- `loss` 是当前样本在当前 `t` 的基础误差
+- `lvlb_weights[t]` 是这个时间步的理论权重
+
+于是：
+
+\[
+L_{vlb} \approx \mathbb E_t[w_t \cdot \|\epsilon - \epsilon_\theta(x_t,t)\|^2]
+\]
+
+这里的 \(w_t\) 就是 `lvlb_weights[t]`。
+
+---
+
+## 3.2 它为什么叫 `loss_vlb`
+
+因为它是在近似 / 对应 **variational lower bound** 里的那部分项。
+
+DDPM 理论上最完整的目标是负对数似然的变分上界分解：
+
+\[
+L_{vlb} = L_0 + L_1 + \cdots + L_T
+\]
+
+但工程上大家通常不会只用它训练，因为：
+
+- 训练不如 simplified objective 稳
+- 数值尺度不一定好
+- 实际采样质量 often simplified 更好
+
+所以常见做法是：
+
+- 主体用 `L_simple`
+- 再可选地混一点 `L_vlb`
+
+这里就是这个套路。
+
+---
+
+# 4. 最终 `loss` 是怎么组合的
+
+[ddpm.py:317](<PATH>)
+
+```python
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+```
+
+数学上就是：
+
+\[
+L = L_{simple} + \lambda_{elbo} L_{vlb}
+\]
+
+其中：
+
+- \(L_{simple}\)：简化噪声预测损失
+- \(L_{vlb}\)：和变分下界相关的加权项
+- \(\lambda_{elbo}\)：`original_elbo_weight`
+
+默认值在：
+[ddpm.py:65](<PATH>)
+
+```python
+original_elbo_weight=0.
+```
+
+这意味着默认情况下：
+
+\[
+L = L_{simple}
+\]
+
+也就是说：
+
+> 默认训练时，`loss_vlb` 会被算出来并记录日志，但不会真正参与最终优化。
+
+这点非常重要。
+
+---
+
+# 5. 所以你说“我看不止用了 L2 loss”是对的
+
+更准确地说：
+
+### 默认配置下
+- 基础误差形式是 `L2` 或 `L1`，取决于 `loss_type`
+- 最终真正参与优化的通常是 `loss_simple`
+- `loss_vlb` 更多是被记录 / 可选混入
+
+### 从代码结构上看
+它确实是一个**组合目标**，不是单独一个裸 L2。
+
+---
+
+# 6. 这段代码里每个变量的角色
+
+### `loss`
+这一行之后的 `loss`：
+
+```python
+loss = self.get_loss(...).mean(dim=[1,2,3])
+```
+
+表示：
+
+- 每个样本的基础误差
+- shape `[B]`
+
+---
+
+### `loss_simple`
+
+```python
+loss_simple = loss.mean() * self.l_simple_weight
+```
+
+表示：
+
+- batch 平均后的 simplified diffusion objective
+- 是训练主项
+
+---
+
+### `loss_vlb`
+
+```python
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+```
+
+表示：
+
+- 按时间步理论权重重加权后的 VLB 相关项
+- 不是单纯像素 MSE
+- 和时间步 `t` 紧密相关
+
+---
+
+### `loss`
+
+最后重新赋值后的：
+
+```python
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+```
+
+表示：
+
+- 最终回传优化器的总损失
+
+---
+
+# 7. 再从“论文 vs 工程”角度总结一下
+
+### 论文理论目标
+DDPM 有完整的变分目标：
+
+\[
+L_{vlb}
+\]
+
+### 工程实践
+最常见的是 simplified objective：
+
+\[
+L_{simple}
+=
+\mathbb E\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\]
+
+### 这个实现
+采用的是：
+
+\[
+L = L_{simple} + \lambda L_{vlb}
+\]
+
+并且默认：
+
+\[
+\lambda = 0
+\]
+
+所以默认等价于：
+
+\[
+L = L_{simple}
+\]
+
+---
+
+# 8. 最容易误解的点
+
+很多人看到：
+
+```python
+loss_vlb = ...
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+```
+
+会以为训练一定同时用了两种 loss。
+
+其实不一定。
+
+因为默认：
+
+```python
+original_elbo_weight = 0.
+```
+
+所以**默认情况下 `loss_vlb` 不参与梯度，只是记录出来给你看**。
+
+---
+
+# 9. 一句话总结
+
+这段代码实现的不是“只有一个 L2 loss”，而是：
+
+> 先算逐样本的基础去噪误差，再构造两个目标：
+> `loss_simple` 是 DDPM 最经典的 simplified 噪声预测损失，
+> `loss_vlb` 是按时间步加权的变分下界相关项，
+> 最终总损失是两者加权和；但默认配置下 `original_elbo_weight=0`，所以实际训练通常只优化 `loss_simple`。
+
+如果你愿意，我下一步可以继续把这两个东西再往深里拆一层：
+
+1. `lvlb_weights[t]` 这个权重是怎么从论文公式里来的
+2. `parameterization="eps"` 和 `"x0"` 时，这段 loss 在数学意义上分别对应什么
+
+## [#68] User
+- Timestamp: `2026-04-15 00:49:54`
+
+# Context from my IDE setup:
+
+## Active file: ldm/models/diffusion/ddpm.py
+
+## Active selection of the file:
+original_elbo_weight
+## Open tabs:
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- functools.py: <PATH>
+- .gitignore: .gitignore
+- dependency_links.txt: latent_diffusion.egg-info/dependency_links.txt
+
+## My request for Codex:
+loss_vlb这个对应论文哪一段哪个公式
+
+## [#69] Assistant
+- Timestamp: `2026-04-15 00:50:00`
+
+我去把 DDPM 论文里 ELBO/VLB 那一段和公式号对上，再把这个实现里的 `loss_vlb` 映射到论文里的哪一项说清楚。
+
+## [#70] Assistant
+- Timestamp: `2026-04-15 00:51:25`
+
+`loss_vlb` **不是直接对应 DDPM 论文里那条“原始 KL 展开式”的代码翻译**，而是对应：
+
+> 把论文里的 **variational lower bound / ELBO 各时间步项** 改写成“按时间步加权的预测误差”之后的实现。
+
+所以如果你问“最原始对应哪一段”，答案是：
+
+**先对应 DDPM 论文 Section 3 的 variational bound，核心是公式 (5)**，
+然后在实现层面更接近 **把 \(L_{t-1}\) 改写成加权 MSE 的那几步推导**，也就是后面把 KL 项写成预测误差形式的公式。
+
+参考：
+- DDPM 论文（NeurIPS 2020）
+  https://proceedings.neurips.cc/paper/2020/hash/4c5bcfec8584af0d967f1ab10179ca4b-Abstract.html
+- 论文 PDF 页面
+  https://hojonathanho.github.io/diffusion/assets/denoising_diffusion20.pdf
+- Improved DDPM 论文
+  https://proceedings.mlr.press/v139/nichol21a.html
+
+---
+
+## 1. 论文里最原始的 VLB 是哪条
+
+DDPM 论文 Section 3 先把负对数似然写成变分上界，形式是：
+
+\[
+L_{vlb}
+=
+\mathbb E_q\Big[
+D_{KL}(q(x_T|x_0)\|p(x_T))
++
+\sum_{t=2}^{T} D_{KL}(q(x_{t-1}|x_t,x_0)\|p_\theta(x_{t-1}|x_t))
+-
+\log p_\theta(x_0|x_1)
+\Big]
+\]
+
+这就是论文里那个总的 variational bound。通常你会看到它被拆成：
+
+\[
+L_{vlb} = L_0 + L_1 + \cdots + L_{T-1} + L_T
+\]
+
+你现在代码里的 `loss_vlb`，概念上就是在对应这个 **VLB/ELBO 主线**。
+
+---
+
+## 2. 为什么代码里看起来不像 KL，而像“权重乘 MSE”
+
+因为 DDPM 论文后面进一步推导了：
+
+对于固定方差设置，
+每个时间步的 KL 项 \(L_{t-1}\) 可以化成一个**与模型预测误差成正比**的项。
+
+如果模型用噪声参数化：
+
+\[
+\mu_\theta(x_t,t) \leftrightarrow \epsilon_\theta(x_t,t)
+\]
+
+那么每步 KL 项可以写成“某个只依赖于 \(t\) 的系数”乘上：
+
+\[
+\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\]
+
+也就是这种结构：
+
+\[
+L_{t-1} \propto w_t \cdot \|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\]
+
+你代码里的：
+
+[ddpm.py:314](<PATH>)
+
+```python
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+```
+
+就是在干这个事。
+
+---
+
+## 3. `lvlb_weights[t]` 对应论文里的哪部分
+
+这组权重在：
+
+[ddpm.py:159](<PATH>)
+
+```python
+lvlb_weights = self.betas ** 2 / (
+    2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
+```
+
+如果是 `eps` 参数化，它对应的就是：
+
+\[
+w_t
+=
+\frac{\beta_t^2}{
+2\,\sigma_t^2\,\alpha_t\,(1-\bar{\alpha}_t)
+}
+\]
+
+这个形式正是把每步 KL 项改写成噪声预测误差之后得到的时间步系数。
+
+所以更准确地说：
+
+- `loss_simple` 对应论文里后来常用的 **简化目标** `L_simple`
+- `loss_vlb` 对应论文里 **原始 VLB 各项的加权版本**
+- `lvlb_weights[t]` 就是从论文“每步 KL 项改写”里来的那个 \(w_t\)
+
+---
+
+## 4. 它和论文里的 `L_simple` 是什么关系
+
+DDPM 论文里一个很关键的点是：
+
+- 完整 VLB 目标理论更完整
+- 但实际训练时，直接用一个更简单的目标效果 often 更好
+
+这个简化目标通常写成：
+
+\[
+L_{simple}
+=
+\mathbb E_{x_0,\epsilon,t}
+\left[
+\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\right]
+\]
+
+也就是**不乘那些时间步系数**，直接做均匀 MSE。
+
+代码里对应：
+
+[ddpm.py:311](<PATH>)
+
+```python
+loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
+loss_simple = loss.mean() * self.l_simple_weight
+```
+
+而：
+
+[ddpm.py:314](<PATH>)
+
+```python
+loss_vlb = (self.lvlb_weights[t] * loss).mean()
+```
+
+对应的是“带权”的版本。
+
+所以你可以这样理解：
+
+\[
+loss\_simple \leftrightarrow L_{simple}
+\]
+
+\[
+loss\_vlb \leftrightarrow \text{加权后的 } L_{vlb} \text{ 相关项}
+\]
+
+---
+
+## 5. 为什么我说它“不直接等于公式 (5)”
+
+因为公式 (5) 是**总 VLB 的 KL 分解形式**，长这样：
+
+\[
+D_{KL}(...) + \sum D_{KL}(...) - \log p_\theta(...)
+\]
+
+而你代码里的 `loss_vlb` 已经不是显式地逐项算 KL 了，
+它是利用论文推导，把这些 KL 项在当前参数化下改写成了：
+
+\[
+w_t \cdot \|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\]
+
+所以它和论文的关系是：
+
+1. **理论来源**：公式 (5) 那条 VLB 主线
+2. **实现形式**：后续把每步 KL 改写成 weighted MSE 之后的结果
+
+---
+
+## 6. 这段代码最终和论文目标怎么对齐
+
+代码最终是：
+
+[ddpm.py:317](<PATH>)
+
+```python
+loss = loss_simple + self.original_elbo_weight * loss_vlb
+```
+
+这更像是：
+
+\[
+L = L_{simple} + \lambda \, L_{vlb}
+\]
+
+这和后来的 **Improved DDPM** 里常见的 hybrid / mixed objective 思路更接近，而不只是 DDPM 原论文最朴素的单一写法。
+
+Improved DDPM 论文和官方仓库里也明确讨论了：
+- VLB
+- simplified objective
+- hybrid objective
+
+参考：
+- Improved DDPM 论文
+  https://proceedings.mlr.press/v139/nichol21a.html
+- OpenAI 官方实现
+  https://github.com/openai/improved-diffusion
+
+---
+
+## 7. 直接回答你的问题
+
+`loss_vlb` 对应论文中：
+
+- **理论上**：DDPM 论文 Section 3 里 **variational bound / ELBO** 那一段，核心是总目标公式 (5)
+- **实现上更直接对应**：把每个时间步 KL 项 \(L_{t-1}\) 改写成 **按时间步加权的噪声预测 MSE** 的那一步推导
+
+所以它**不是公式 (5) 的原样代码**，而是公式 (5) 后续推导得到的“weighted per-timestep training term”。
+
+---
+
+## 8. 最简短的记忆法
+
+你可以这样记：
+
+- `loss_simple`
+  对应论文里的 **简化噪声预测目标**
+
+- `loss_vlb`
+  对应论文里的 **VLB/ELBO 主线**，但已经被改写成了 **weighted MSE**
+
+---
+
+参考链接：
+- DDPM NeurIPS 页面
+  https://proceedings.neurips.cc/paper/2020/hash/4c5bcfec8584af0d967f1ab10179ca4b-Abstract.html
+- DDPM PDF
+  https://hojonathanho.github.io/diffusion/assets/denoising_diffusion20.pdf
+- Improved DDPM
+  https://proceedings.mlr.press/v139/nichol21a.html
+- OpenAI improved-diffusion code
+  https://github.com/openai/improved-diffusion
+
+如果你愿意，我下一步可以直接把 **“从论文里的 \(L_{t-1}\) KL 项，推到代码里 `lvlb_weights[t] * loss`”** 这一段公式完整推一遍。
+
+## [#71] User
+- Timestamp: `2026-04-15 00:55:18`
+
+# Context from my IDE setup:
+
+## Active file: ldm/modules/diffusionmodules/openaimodel.py
+
+## Active selection of the file:
+class UNetModel(nn.Module):
+## Open tabs:
+- openaimodel.py: ldm/modules/diffusionmodules/openaimodel.py
+- distributions.py: ldm/modules/distributions/distributions.py
+- autoencoder.py: ldm/models/autoencoder.py
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- util.py: ldm/modules/diffusionmodules/util.py
+
+# Files mentioned by the user:
+
+## openaimodel.py: <PATH> (line 413)
+
+## My request for Codex:
+详细解析这个unet网络
+
+## [#72] Assistant
+- Timestamp: `2026-04-15 00:55:32`
+
+我先把这个 `UNetModel` 的定义、构造阶段和 `forward` 主链完整拉出来，再按“输入块 / 中间块 / 输出块 / 时间步嵌入 / attention 条件注入”几个部分拆解。这样我们能把实现细节和 Stable Diffusion 里的实际用法一一对上。
+
+## [tool] exec_command
+- Call ID: `call_qoMejdpGj4cMdeyv87ZfctdI`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/openaimodel.py | sed -n '1,220p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 7000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_K2mI0zuL5inM0cD2VeNokMut`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/openaimodel.py | sed -n '220,520p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 10000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_zhpgh59WTd1FS1jAdPnqHLMq`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/openaimodel.py | sed -n '520,860p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 12000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_amwZ5GKdOrQ85WNXThOKWdE4`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Arguments
+```json
+{
+  "cmd": "rg -n \"^class UNetModel|^class ResBlock|^class AttentionBlock|^class TimestepEmbedSequential|^class Downsample|^class Upsample|^class QKVAttention|^class QKVAttentionLegacy|def forward\\(\" ldm/modules/diffusionmodules/openaimodel.py",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 6000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_odmYQ0kGUjCiJQT2MzwDLBNd`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba configs/stable-diffusion/v1-inference.yaml | sed -n '29,45p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_qoMejdpGj4cMdeyv87ZfctdI`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Output
+```
+Chunk ID: 21eafb
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 2111
+Output:
+     1	from abc import abstractmethod
+     2	from functools import partial
+     3	import math
+     4	from typing import Iterable
+     5	
+     6	import numpy as np
+     7	import torch as th
+     8	import torch.nn as nn
+     9	import torch.nn.functional as F
+    10	
+    11	from ldm.modules.diffusionmodules.util import (
+    12	    checkpoint,
+    13	    conv_nd,
+    14	    linear,
+    15	    avg_pool_nd,
+    16	    zero_module,
+    17	    normalization,
+    18	    timestep_embedding,
+    19	)
+    20	from ldm.modules.attention import SpatialTransformer
+    21	
+    22	
+    23	# dummy replace
+    24	def convert_module_to_f16(x):
+    25	    pass
+    26	
+    27	def convert_module_to_f32(x):
+    28	    pass
+    29	
+    30	
+    31	## go
+    32	class AttentionPool2d(nn.Module):
+    33	    """
+    34	    Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
+    35	    """
+    36	
+    37	    def __init__(
+    38	        self,
+    39	        spacial_dim: int,
+    40	        embed_dim: int,
+    41	        num_heads_channels: int,
+    42	        output_dim: int = None,
+    43	    ):
+    44	        super().__init__()
+    45	        self.positional_embedding = nn.Parameter(th.randn(embed_dim, spacial_dim ** 2 + 1) / embed_dim ** 0.5)
+    46	        self.qkv_proj = conv_nd(1, embed_dim, 3 * embed_dim, 1)
+    47	        self.c_proj = conv_nd(1, embed_dim, output_dim or embed_dim, 1)
+    48	        self.num_heads = embed_dim // num_heads_channels
+    49	        self.attention = QKVAttention(self.num_heads)
+    50	
+    51	    def forward(self, x):
+    52	        b, c, *_spatial = x.shape
+    53	        x = x.reshape(b, c, -1)  # NC(HW)
+    54	        x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # NC(HW+1)
+    55	        x = x + self.positional_embedding[None, :, :].to(x.dtype)  # NC(HW+1)
+    56	        x = self.qkv_proj(x)
+    57	        x = self.attention(x)
+    58	        x = self.c_proj(x)
+    59	        return x[:, :, 0]
+    60	
+    61	
+    62	class TimestepBlock(nn.Module):
+    63	    """
+    64	    Any module where forward() takes timestep embeddings as a second argument.
+    65	    """
+    66	
+    67	    @abstractmethod
+    68	    def forward(self, x, emb):
+    69	        """
+    70	        Apply the module to `x` given `emb` timestep embeddings.
+    71	        """
+    72	
+    73	
+    74	class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+    75	    """
+    76	    A sequential module that passes timestep embeddings to the children that
+    77	    support it as an extra input.
+    78	    """
+    79	
+    80	    def forward(self, x, emb, context=None):
+    81	        for layer in self:
+    82	            if isinstance(layer, TimestepBlock):
+    83	                x = layer(x, emb)
+    84	            elif isinstance(layer, SpatialTransformer):
+    85	                x = layer(x, context)
+    86	            else:
+    87	                x = layer(x)
+    88	        return x
+    89	
+    90	
+    91	class Upsample(nn.Module):
+    92	    """
+    93	    An upsampling layer with an optional convolution.
+    94	    :param channels: channels in the inputs and outputs.
+    95	    :param use_conv: a bool determining if a convolution is applied.
+    96	    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+    97	                 upsampling occurs in the inner-two dimensions.
+    98	    """
+    99	
+   100	    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1):
+   101	        super().__init__()
+   102	        self.channels = channels
+   103	        self.out_channels = out_channels or channels
+   104	        self.use_conv = use_conv
+   105	        self.dims = dims
+   106	        if use_conv:
+   107	            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding)
+   108	
+   109	    def forward(self, x):
+   110	        assert x.shape[1] == self.channels
+   111	        if self.dims == 3:
+   112	            x = F.interpolate(
+   113	                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+   114	            )
+   115	        else:
+   116	            x = F.interpolate(x, scale_factor=2, mode="nearest")
+   117	        if self.use_conv:
+   118	            x = self.conv(x)
+   119	        return x
+   120	
+   121	class TransposedUpsample(nn.Module):
+   122	    'Learned 2x upsampling without padding'
+   123	    def __init__(self, channels, out_channels=None, ks=5):
+   124	        super().__init__()
+   125	        self.channels = channels
+   126	        self.out_channels = out_channels or channels
+   127	
+   128	        self.up = nn.ConvTranspose2d(self.channels,self.out_channels,kernel_size=ks,stride=2)
+   129	
+   130	    def forward(self,x):
+   131	        return self.up(x)
+   132	
+   133	
+   134	class Downsample(nn.Module):
+   135	    """
+   136	    A downsampling layer with an optional convolution.
+   137	    :param channels: channels in the inputs and outputs.
+   138	    :param use_conv: a bool determining if a convolution is applied.
+   139	    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+   140	                 downsampling occurs in the inner-two dimensions.
+   141	    """
+   142	
+   143	    def __init__(self, channels, use_conv, dims=2, out_channels=None,padding=1):
+   144	        super().__init__()
+   145	        self.channels = channels
+   146	        self.out_channels = out_channels or channels
+   147	        self.use_conv = use_conv
+   148	        self.dims = dims
+   149	        stride = 2 if dims != 3 else (1, 2, 2)
+   150	        if use_conv:
+   151	            self.op = conv_nd(
+   152	                dims, self.channels, self.out_channels, 3, stride=stride, padding=padding
+   153	            )
+   154	        else:
+   155	            assert self.channels == self.out_channels
+   156	            self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
+   157	
+   158	    def forward(self, x):
+   159	        assert x.shape[1] == self.channels
+   160	        return self.op(x)
+   161	
+   162	
+   163	class ResBlock(TimestepBlock):
+   164	    """
+   165	    A residual block that can optionally change the number of channels.
+   166	    :param channels: the number of input channels.
+   167	    :param emb_channels: the number of timestep embedding channels.
+   168	    :param dropout: the rate of dropout.
+   169	    :param out_channels: if specified, the number of out channels.
+   170	    :param use_conv: if True and out_channels is specified, use a spatial
+   171	        convolution instead of a smaller 1x1 convolution to change the
+   172	        channels in the skip connection.
+   173	    :param dims: determines if the signal is 1D, 2D, or 3D.
+   174	    :param use_checkpoint: if True, use gradient checkpointing on this module.
+   175	    :param up: if True, use this block for upsampling.
+   176	    :param down: if True, use this block for downsampling.
+   177	    """
+   178	
+   179	    def __init__(
+   180	        self,
+   181	        channels,
+   182	        emb_channels,
+   183	        dropout,
+   184	        out_channels=None,
+   185	        use_conv=False,
+   186	        use_scale_shift_norm=False,
+   187	        dims=2,
+   188	        use_checkpoint=False,
+   189	        up=False,
+   190	        down=False,
+   191	    ):
+   192	        super().__init__()
+   193	        self.channels = channels
+   194	        self.emb_channels = emb_channels
+   195	        self.dropout = dropout
+   196	        self.out_channels = out_channels or channels
+   197	        self.use_conv = use_conv
+   198	        self.use_checkpoint = use_checkpoint
+   199	        self.use_scale_shift_norm = use_scale_shift_norm
+   200	
+   201	        self.in_layers = nn.Sequential(
+   202	            normalization(channels),
+   203	            nn.SiLU(),
+   204	            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+   205	        )
+   206	
+   207	        self.updown = up or down
+   208	
+   209	        if up:
+   210	            self.h_upd = Upsample(channels, False, dims)
+   211	            self.x_upd = Upsample(channels, False, dims)
+   212	        elif down:
+   213	            self.h_upd = Downsample(channels, False, dims)
+   214	            self.x_upd = Downsample(channels, False, dims)
+   215	        else:
+   216	            self.h_upd = self.x_upd = nn.Identity()
+   217	
+   218	        self.emb_layers = nn.Sequential(
+   219	            nn.SiLU(),
+   220	            linear(
+
+```
+
+## [tool output]
+- Call ID: `call_K2mI0zuL5inM0cD2VeNokMut`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Output
+```
+Chunk ID: 084532
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 3409
+Output:
+   220	            linear(
+   221	                emb_channels,
+   222	                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+   223	            ),
+   224	        )
+   225	        self.out_layers = nn.Sequential(
+   226	            normalization(self.out_channels),
+   227	            nn.SiLU(),
+   228	            nn.Dropout(p=dropout),
+   229	            zero_module(
+   230	                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+   231	            ),
+   232	        )
+   233	
+   234	        if self.out_channels == channels:
+   235	            self.skip_connection = nn.Identity()
+   236	        elif use_conv:
+   237	            self.skip_connection = conv_nd(
+   238	                dims, channels, self.out_channels, 3, padding=1
+   239	            )
+   240	        else:
+   241	            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+   242	
+   243	    def forward(self, x, emb):
+   244	        """
+   245	        Apply the block to a Tensor, conditioned on a timestep embedding.
+   246	        :param x: an [N x C x ...] Tensor of features.
+   247	        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+   248	        :return: an [N x C x ...] Tensor of outputs.
+   249	        """
+   250	        return checkpoint(
+   251	            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+   252	        )
+   253	
+   254	
+   255	    def _forward(self, x, emb):
+   256	        if self.updown:
+   257	            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+   258	            h = in_rest(x)
+   259	            h = self.h_upd(h)
+   260	            x = self.x_upd(x)
+   261	            h = in_conv(h)
+   262	        else:
+   263	            h = self.in_layers(x)
+   264	        emb_out = self.emb_layers(emb).type(h.dtype)
+   265	        while len(emb_out.shape) < len(h.shape):
+   266	            emb_out = emb_out[..., None]
+   267	        if self.use_scale_shift_norm:
+   268	            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+   269	            scale, shift = th.chunk(emb_out, 2, dim=1)
+   270	            h = out_norm(h) * (1 + scale) + shift
+   271	            h = out_rest(h)
+   272	        else:
+   273	            h = h + emb_out
+   274	            h = self.out_layers(h)
+   275	        return self.skip_connection(x) + h
+   276	
+   277	
+   278	class AttentionBlock(nn.Module):
+   279	    """
+   280	    An attention block that allows spatial positions to attend to each other.
+   281	    Originally ported from here, but adapted to the N-d case.
+   282	    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+   283	    """
+   284	
+   285	    def __init__(
+   286	        self,
+   287	        channels,
+   288	        num_heads=1,
+   289	        num_head_channels=-1,
+   290	        use_checkpoint=False,
+   291	        use_new_attention_order=False,
+   292	    ):
+   293	        super().__init__()
+   294	        self.channels = channels
+   295	        if num_head_channels == -1:
+   296	            self.num_heads = num_heads
+   297	        else:
+   298	            assert (
+   299	                channels % num_head_channels == 0
+   300	            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+   301	            self.num_heads = channels // num_head_channels
+   302	        self.use_checkpoint = use_checkpoint
+   303	        self.norm = normalization(channels)
+   304	        self.qkv = conv_nd(1, channels, channels * 3, 1)
+   305	        if use_new_attention_order:
+   306	            # split qkv before split heads
+   307	            self.attention = QKVAttention(self.num_heads)
+   308	        else:
+   309	            # split heads before split qkv
+   310	            self.attention = QKVAttentionLegacy(self.num_heads)
+   311	
+   312	        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+   313	
+   314	    def forward(self, x):
+   315	        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+   316	        #return pt_checkpoint(self._forward, x)  # pytorch
+   317	
+   318	    def _forward(self, x):
+   319	        b, c, *spatial = x.shape
+   320	        x = x.reshape(b, c, -1)
+   321	        qkv = self.qkv(self.norm(x))
+   322	        h = self.attention(qkv)
+   323	        h = self.proj_out(h)
+   324	        return (x + h).reshape(b, c, *spatial)
+   325	
+   326	
+   327	def count_flops_attn(model, _x, y):
+   328	    """
+   329	    A counter for the `thop` package to count the operations in an
+   330	    attention operation.
+   331	    Meant to be used like:
+   332	        macs, params = thop.profile(
+   333	            model,
+   334	            inputs=(inputs, timestamps),
+   335	            custom_ops={QKVAttention: QKVAttention.count_flops},
+   336	        )
+   337	    """
+   338	    b, c, *spatial = y[0].shape
+   339	    num_spatial = int(np.prod(spatial))
+   340	    # We perform two matmuls with the same number of ops.
+   341	    # The first computes the weight matrix, the second computes
+   342	    # the combination of the value vectors.
+   343	    matmul_ops = 2 * b * (num_spatial ** 2) * c
+   344	    model.total_ops += th.DoubleTensor([matmul_ops])
+   345	
+   346	
+   347	class QKVAttentionLegacy(nn.Module):
+   348	    """
+   349	    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
+   350	    """
+   351	
+   352	    def __init__(self, n_heads):
+   353	        super().__init__()
+   354	        self.n_heads = n_heads
+   355	
+   356	    def forward(self, qkv):
+   357	        """
+   358	        Apply QKV attention.
+   359	        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
+   360	        :return: an [N x (H * C) x T] tensor after attention.
+   361	        """
+   362	        bs, width, length = qkv.shape
+   363	        assert width % (3 * self.n_heads) == 0
+   364	        ch = width // (3 * self.n_heads)
+   365	        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+   366	        scale = 1 / math.sqrt(math.sqrt(ch))
+   367	        weight = th.einsum(
+   368	            "bct,bcs->bts", q * scale, k * scale
+   369	        )  # More stable with f16 than dividing afterwards
+   370	        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+   371	        a = th.einsum("bts,bcs->bct", weight, v)
+   372	        return a.reshape(bs, -1, length)
+   373	
+   374	    @staticmethod
+   375	    def count_flops(model, _x, y):
+   376	        return count_flops_attn(model, _x, y)
+   377	
+   378	
+   379	class QKVAttention(nn.Module):
+   380	    """
+   381	    A module which performs QKV attention and splits in a different order.
+   382	    """
+   383	
+   384	    def __init__(self, n_heads):
+   385	        super().__init__()
+   386	        self.n_heads = n_heads
+   387	
+   388	    def forward(self, qkv):
+   389	        """
+   390	        Apply QKV attention.
+   391	        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
+   392	        :return: an [N x (H * C) x T] tensor after attention.
+   393	        """
+   394	        bs, width, length = qkv.shape
+   395	        assert width % (3 * self.n_heads) == 0
+   396	        ch = width // (3 * self.n_heads)
+   397	        q, k, v = qkv.chunk(3, dim=1)
+   398	        scale = 1 / math.sqrt(math.sqrt(ch))
+   399	        weight = th.einsum(
+   400	            "bct,bcs->bts",
+   401	            (q * scale).view(bs * self.n_heads, ch, length),
+   402	            (k * scale).view(bs * self.n_heads, ch, length),
+   403	        )  # More stable with f16 than dividing afterwards
+   404	        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+   405	        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+   406	        return a.reshape(bs, -1, length)
+   407	
+   408	    @staticmethod
+   409	    def count_flops(model, _x, y):
+   410	        return count_flops_attn(model, _x, y)
+   411	
+   412	
+   413	class UNetModel(nn.Module):
+   414	    """
+   415	    The full UNet model with attention and timestep embedding.
+   416	    :param in_channels: channels in the input Tensor.
+   417	    :param model_channels: base channel count for the model.
+   418	    :param out_channels: channels in the output Tensor.
+   419	    :param num_res_blocks: number of residual blocks per downsample.
+   420	    :param attention_resolutions: a collection of downsample rates at which
+   421	        attention will take place. May be a set, list, or tuple.
+   422	        For example, if this contains 4, then at 4x downsampling, attention
+   423	        will be used.
+   424	    :param dropout: the dropout probability.
+   425	    :param channel_mult: channel multiplier for each level of the UNet.
+   426	    :param conv_resample: if True, use learned convolutions for upsampling and
+   427	        downsampling.
+   428	    :param dims: determines if the signal is 1D, 2D, or 3D.
+   429	    :param num_classes: if specified (as an int), then this model will be
+   430	        class-conditional with `num_classes` classes.
+   431	    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
+   432	    :param num_heads: the number of attention heads in each attention layer.
+   433	    :param num_heads_channels: if specified, ignore num_heads and instead use
+   434	                               a fixed channel width per attention head.
+   435	    :param num_heads_upsample: works with num_heads to set a different number
+   436	                               of heads for upsampling. Deprecated.
+   437	    :param use_scale_shift_norm: use a FiLM-like conditioning mechanism.
+   438	    :param resblock_updown: use residual blocks for up/downsampling.
+   439	    :param use_new_attention_order: use a different attention pattern for potentially
+   440	                                    increased efficiency.
+   441	    """
+   442	
+   443	    def __init__(
+   444	        self,
+   445	        image_size,
+   446	        in_channels,
+   447	        model_channels,
+   448	        out_channels,
+   449	        num_res_blocks,
+   450	        attention_resolutions,
+   451	        dropout=0,
+   452	        channel_mult=(1, 2, 4, 8),
+   453	        conv_resample=True,
+   454	        dims=2,
+   455	        num_classes=None,
+   456	        use_checkpoint=False,
+   457	        use_fp16=False,
+   458	        num_heads=-1,
+   459	        num_head_channels=-1,
+   460	        num_heads_upsample=-1,
+   461	        use_scale_shift_norm=False,
+   462	        resblock_updown=False,
+   463	        use_new_attention_order=False,
+   464	        use_spatial_transformer=False,    # custom transformer support
+   465	        transformer_depth=1,              # custom transformer support
+   466	        context_dim=None,                 # custom transformer support
+   467	        n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
+   468	        legacy=True,
+   469	    ):
+   470	        super().__init__()
+   471	        if use_spatial_transformer:
+   472	            assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
+   473	
+   474	        if context_dim is not None:
+   475	            assert use_spatial_transformer, 'Fool!! You forgot to use the spatial transformer for your cross-attention conditioning...'
+   476	            from omegaconf.listconfig import ListConfig
+   477	            if type(context_dim) == ListConfig:
+   478	                context_dim = list(context_dim)
+   479	
+   480	        if num_heads_upsample == -1:
+   481	            num_heads_upsample = num_heads
+   482	
+   483	        if num_heads == -1:
+   484	            assert num_head_channels != -1, 'Either num_heads or num_head_channels has to be set'
+   485	
+   486	        if num_head_channels == -1:
+   487	            assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
+   488	
+   489	        self.image_size = image_size
+   490	        self.in_channels = in_channels
+   491	        self.model_channels = model_channels
+   492	        self.out_channels = out_channels
+   493	        self.num_res_blocks = num_res_blocks
+   494	        self.attention_resolutions = attention_resolutions
+   495	        self.dropout = dropout
+   496	        self.channel_mult = channel_mult
+   497	        self.conv_resample = conv_resample
+   498	        self.num_classes = num_classes
+   499	        self.use_checkpoint = use_checkpoint
+   500	        self.dtype = th.float16 if use_fp16 else th.float32
+   501	        self.num_heads = num_heads
+   502	        self.num_head_channels = num_head_channels
+   503	        self.num_heads_upsample = num_heads_upsample
+   504	        self.predict_codebook_ids = n_embed is not None
+   505	
+   506	        time_embed_dim = model_channels * 4
+   507	        self.time_embed = nn.Sequential(
+   508	            linear(model_channels, time_embed_dim),
+   509	            nn.SiLU(),
+   510	            linear(time_embed_dim, time_embed_dim),
+   511	        )
+   512	
+   513	        if self.num_classes is not None:
+   514	            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+   515	
+   516	        self.input_blocks = nn.ModuleList(
+   517	            [
+   518	                TimestepEmbedSequential(
+   519	                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+   520	                )
+
+```
+
+## [tool output]
+- Call ID: `call_zhpgh59WTd1FS1jAdPnqHLMq`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Output
+```
+Chunk ID: 8f184a
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 3885
+Output:
+   520	                )
+   521	            ]
+   522	        )
+   523	        self._feature_size = model_channels
+   524	        input_block_chans = [model_channels]
+   525	        ch = model_channels
+   526	        ds = 1
+   527	        for level, mult in enumerate(channel_mult):
+   528	            for _ in range(num_res_blocks):
+   529	                layers = [
+   530	                    ResBlock(
+   531	                        ch,
+   532	                        time_embed_dim,
+   533	                        dropout,
+   534	                        out_channels=mult * model_channels,
+   535	                        dims=dims,
+   536	                        use_checkpoint=use_checkpoint,
+   537	                        use_scale_shift_norm=use_scale_shift_norm,
+   538	                    )
+   539	                ]
+   540	                ch = mult * model_channels
+   541	                if ds in attention_resolutions:
+   542	                    if num_head_channels == -1:
+   543	                        dim_head = ch // num_heads
+   544	                    else:
+   545	                        num_heads = ch // num_head_channels
+   546	                        dim_head = num_head_channels
+   547	                    if legacy:
+   548	                        #num_heads = 1
+   549	                        dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+   550	                    layers.append(
+   551	                        AttentionBlock(
+   552	                            ch,
+   553	                            use_checkpoint=use_checkpoint,
+   554	                            num_heads=num_heads,
+   555	                            num_head_channels=dim_head,
+   556	                            use_new_attention_order=use_new_attention_order,
+   557	                        ) if not use_spatial_transformer else SpatialTransformer(
+   558	                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+   559	                        )
+   560	                    )
+   561	                self.input_blocks.append(TimestepEmbedSequential(*layers))
+   562	                self._feature_size += ch
+   563	                input_block_chans.append(ch)
+   564	            if level != len(channel_mult) - 1:
+   565	                out_ch = ch
+   566	                self.input_blocks.append(
+   567	                    TimestepEmbedSequential(
+   568	                        ResBlock(
+   569	                            ch,
+   570	                            time_embed_dim,
+   571	                            dropout,
+   572	                            out_channels=out_ch,
+   573	                            dims=dims,
+   574	                            use_checkpoint=use_checkpoint,
+   575	                            use_scale_shift_norm=use_scale_shift_norm,
+   576	                            down=True,
+   577	                        )
+   578	                        if resblock_updown
+   579	                        else Downsample(
+   580	                            ch, conv_resample, dims=dims, out_channels=out_ch
+   581	                        )
+   582	                    )
+   583	                )
+   584	                ch = out_ch
+   585	                input_block_chans.append(ch)
+   586	                ds *= 2
+   587	                self._feature_size += ch
+   588	
+   589	        if num_head_channels == -1:
+   590	            dim_head = ch // num_heads
+   591	        else:
+   592	            num_heads = ch // num_head_channels
+   593	            dim_head = num_head_channels
+   594	        if legacy:
+   595	            #num_heads = 1
+   596	            dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+   597	        self.middle_block = TimestepEmbedSequential(
+   598	            ResBlock(
+   599	                ch,
+   600	                time_embed_dim,
+   601	                dropout,
+   602	                dims=dims,
+   603	                use_checkpoint=use_checkpoint,
+   604	                use_scale_shift_norm=use_scale_shift_norm,
+   605	            ),
+   606	            AttentionBlock(
+   607	                ch,
+   608	                use_checkpoint=use_checkpoint,
+   609	                num_heads=num_heads,
+   610	                num_head_channels=dim_head,
+   611	                use_new_attention_order=use_new_attention_order,
+   612	            ) if not use_spatial_transformer else SpatialTransformer(
+   613	                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+   614	                        ),
+   615	            ResBlock(
+   616	                ch,
+   617	                time_embed_dim,
+   618	                dropout,
+   619	                dims=dims,
+   620	                use_checkpoint=use_checkpoint,
+   621	                use_scale_shift_norm=use_scale_shift_norm,
+   622	            ),
+   623	        )
+   624	        self._feature_size += ch
+   625	
+   626	        self.output_blocks = nn.ModuleList([])
+   627	        for level, mult in list(enumerate(channel_mult))[::-1]:
+   628	            for i in range(num_res_blocks + 1):
+   629	                ich = input_block_chans.pop()
+   630	                layers = [
+   631	                    ResBlock(
+   632	                        ch + ich,
+   633	                        time_embed_dim,
+   634	                        dropout,
+   635	                        out_channels=model_channels * mult,
+   636	                        dims=dims,
+   637	                        use_checkpoint=use_checkpoint,
+   638	                        use_scale_shift_norm=use_scale_shift_norm,
+   639	                    )
+   640	                ]
+   641	                ch = model_channels * mult
+   642	                if ds in attention_resolutions:
+   643	                    if num_head_channels == -1:
+   644	                        dim_head = ch // num_heads
+   645	                    else:
+   646	                        num_heads = ch // num_head_channels
+   647	                        dim_head = num_head_channels
+   648	                    if legacy:
+   649	                        #num_heads = 1
+   650	                        dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+   651	                    layers.append(
+   652	                        AttentionBlock(
+   653	                            ch,
+   654	                            use_checkpoint=use_checkpoint,
+   655	                            num_heads=num_heads_upsample,
+   656	                            num_head_channels=dim_head,
+   657	                            use_new_attention_order=use_new_attention_order,
+   658	                        ) if not use_spatial_transformer else SpatialTransformer(
+   659	                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+   660	                        )
+   661	                    )
+   662	                if level and i == num_res_blocks:
+   663	                    out_ch = ch
+   664	                    layers.append(
+   665	                        ResBlock(
+   666	                            ch,
+   667	                            time_embed_dim,
+   668	                            dropout,
+   669	                            out_channels=out_ch,
+   670	                            dims=dims,
+   671	                            use_checkpoint=use_checkpoint,
+   672	                            use_scale_shift_norm=use_scale_shift_norm,
+   673	                            up=True,
+   674	                        )
+   675	                        if resblock_updown
+   676	                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+   677	                    )
+   678	                    ds //= 2
+   679	                self.output_blocks.append(TimestepEmbedSequential(*layers))
+   680	                self._feature_size += ch
+   681	
+   682	        self.out = nn.Sequential(
+   683	            normalization(ch),
+   684	            nn.SiLU(),
+   685	            zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
+   686	        )
+   687	        if self.predict_codebook_ids:
+   688	            self.id_predictor = nn.Sequential(
+   689	            normalization(ch),
+   690	            conv_nd(dims, model_channels, n_embed, 1),
+   691	            #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
+   692	        )
+   693	
+   694	    def convert_to_fp16(self):
+   695	        """
+   696	        Convert the torso of the model to float16.
+   697	        """
+   698	        self.input_blocks.apply(convert_module_to_f16)
+   699	        self.middle_block.apply(convert_module_to_f16)
+   700	        self.output_blocks.apply(convert_module_to_f16)
+   701	
+   702	    def convert_to_fp32(self):
+   703	        """
+   704	        Convert the torso of the model to float32.
+   705	        """
+   706	        self.input_blocks.apply(convert_module_to_f32)
+   707	        self.middle_block.apply(convert_module_to_f32)
+   708	        self.output_blocks.apply(convert_module_to_f32)
+   709	
+   710	    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+   711	        """
+   712	        Apply the model to an input batch.
+   713	        :param x: an [N x C x ...] Tensor of inputs.
+   714	        :param timesteps: a 1-D batch of timesteps.
+   715	        :param context: conditioning plugged in via crossattn
+   716	        :param y: an [N] Tensor of labels, if class-conditional.
+   717	        :return: an [N x C x ...] Tensor of outputs.
+   718	        """
+   719	        assert (y is not None) == (
+   720	            self.num_classes is not None
+   721	        ), "must specify y if and only if the model is class-conditional"
+   722	        hs = []
+   723	        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+   724	        emb = self.time_embed(t_emb)
+   725	
+   726	        if self.num_classes is not None:
+   727	            assert y.shape == (x.shape[0],)
+   728	            emb = emb + self.label_emb(y)
+   729	
+   730	        h = x.type(self.dtype)
+   731	        for module in self.input_blocks:
+   732	            h = module(h, emb, context)
+   733	            hs.append(h)
+   734	        h = self.middle_block(h, emb, context)
+   735	        for module in self.output_blocks:
+   736	            h = th.cat([h, hs.pop()], dim=1)
+   737	            h = module(h, emb, context)
+   738	        h = h.type(x.dtype)
+   739	        if self.predict_codebook_ids:
+   740	            return self.id_predictor(h)
+   741	        else:
+   742	            return self.out(h)
+   743	
+   744	
+   745	class EncoderUNetModel(nn.Module):
+   746	    """
+   747	    The half UNet model with attention and timestep embedding.
+   748	    For usage, see UNet.
+   749	    """
+   750	
+   751	    def __init__(
+   752	        self,
+   753	        image_size,
+   754	        in_channels,
+   755	        model_channels,
+   756	        out_channels,
+   757	        num_res_blocks,
+   758	        attention_resolutions,
+   759	        dropout=0,
+   760	        channel_mult=(1, 2, 4, 8),
+   761	        conv_resample=True,
+   762	        dims=2,
+   763	        use_checkpoint=False,
+   764	        use_fp16=False,
+   765	        num_heads=1,
+   766	        num_head_channels=-1,
+   767	        num_heads_upsample=-1,
+   768	        use_scale_shift_norm=False,
+   769	        resblock_updown=False,
+   770	        use_new_attention_order=False,
+   771	        pool="adaptive",
+   772	        *args,
+   773	        **kwargs
+   774	    ):
+   775	        super().__init__()
+   776	
+   777	        if num_heads_upsample == -1:
+   778	            num_heads_upsample = num_heads
+   779	
+   780	        self.in_channels = in_channels
+   781	        self.model_channels = model_channels
+   782	        self.out_channels = out_channels
+   783	        self.num_res_blocks = num_res_blocks
+   784	        self.attention_resolutions = attention_resolutions
+   785	        self.dropout = dropout
+   786	        self.channel_mult = channel_mult
+   787	        self.conv_resample = conv_resample
+   788	        self.use_checkpoint = use_checkpoint
+   789	        self.dtype = th.float16 if use_fp16 else th.float32
+   790	        self.num_heads = num_heads
+   791	        self.num_head_channels = num_head_channels
+   792	        self.num_heads_upsample = num_heads_upsample
+   793	
+   794	        time_embed_dim = model_channels * 4
+   795	        self.time_embed = nn.Sequential(
+   796	            linear(model_channels, time_embed_dim),
+   797	            nn.SiLU(),
+   798	            linear(time_embed_dim, time_embed_dim),
+   799	        )
+   800	
+   801	        self.input_blocks = nn.ModuleList(
+   802	            [
+   803	                TimestepEmbedSequential(
+   804	                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+   805	                )
+   806	            ]
+   807	        )
+   808	        self._feature_size = model_channels
+   809	        input_block_chans = [model_channels]
+   810	        ch = model_channels
+   811	        ds = 1
+   812	        for level, mult in enumerate(channel_mult):
+   813	            for _ in range(num_res_blocks):
+   814	                layers = [
+   815	                    ResBlock(
+   816	                        ch,
+   817	                        time_embed_dim,
+   818	                        dropout,
+   819	                        out_channels=mult * model_channels,
+   820	                        dims=dims,
+   821	                        use_checkpoint=use_checkpoint,
+   822	                        use_scale_shift_norm=use_scale_shift_norm,
+   823	                    )
+   824	                ]
+   825	                ch = mult * model_channels
+   826	                if ds in attention_resolutions:
+   827	                    layers.append(
+   828	                        AttentionBlock(
+   829	                            ch,
+   830	                            use_checkpoint=use_checkpoint,
+   831	                            num_heads=num_heads,
+   832	                            num_head_channels=num_head_channels,
+   833	                            use_new_attention_order=use_new_attention_order,
+   834	                        )
+   835	                    )
+   836	                self.input_blocks.append(TimestepEmbedSequential(*layers))
+   837	                self._feature_size += ch
+   838	                input_block_chans.append(ch)
+   839	            if level != len(channel_mult) - 1:
+   840	                out_ch = ch
+   841	                self.input_blocks.append(
+   842	                    TimestepEmbedSequential(
+   843	                        ResBlock(
+   844	                            ch,
+   845	                            time_embed_dim,
+   846	                            dropout,
+   847	                            out_channels=out_ch,
+   848	                            dims=dims,
+   849	                            use_checkpoint=use_checkpoint,
+   850	                            use_scale_shift_norm=use_scale_shift_norm,
+   851	                            down=True,
+   852	                        )
+   853	                        if resblock_updown
+   854	                        else Downsample(
+   855	                            ch, conv_resample, dims=dims, out_channels=out_ch
+   856	                        )
+   857	                    )
+   858	                )
+   859	                ch = out_ch
+   860	                input_block_chans.append(ch)
+
+```
+
+## [tool output]
+- Call ID: `call_amwZ5GKdOrQ85WNXThOKWdE4`
+- Timestamp: `2026-04-15 00:55:32`
+
+### Output
+```
+Chunk ID: e3b1f1
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 189
+Output:
+51:    def forward(self, x):
+68:    def forward(self, x, emb):
+74:class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+80:    def forward(self, x, emb, context=None):
+91:class Upsample(nn.Module):
+109:    def forward(self, x):
+130:    def forward(self,x):
+134:class Downsample(nn.Module):
+158:    def forward(self, x):
+163:class ResBlock(TimestepBlock):
+243:    def forward(self, x, emb):
+278:class AttentionBlock(nn.Module):
+314:    def forward(self, x):
+347:class QKVAttentionLegacy(nn.Module):
+356:    def forward(self, qkv):
+379:class QKVAttention(nn.Module):
+388:    def forward(self, qkv):
+413:class UNetModel(nn.Module):
+710:    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+938:    def forward(self, x, timesteps):
+
+```
+
+### Output
+```
+Chunk ID: 8310ed
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 149
+Output:
+    29	    unet_config:
+    30	      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+    31	      params:
+    32	        image_size: 32 # unused
+    33	        in_channels: 4
+    34	        out_channels: 4
+    35	        model_channels: 320
+    36	        attention_resolutions: [ 4, 2, 1 ]
+    37	        num_res_blocks: 2
+    38	        channel_mult: [ 1, 2, 4, 4 ]
+    39	        num_heads: 8
+    40	        use_spatial_transformer: True
+    41	        transformer_depth: 1
+    42	        context_dim: 768
+    43	        use_checkpoint: True
+    44	        legacy: False
+    45	
+
+```
+
+## [#73] Assistant
+- Timestamp: `2026-04-15 00:55:40`
+
+我已经把主干拿到了。接下来我会按这个实现真正的组织方式讲，而不是泛泛说 U-Net：先讲它复用了哪些基础块，再把 SD v1 默认配置代进去，把每一级的通道和分辨率走一遍。
+
+## [tool] exec_command
+- Call ID: `call_h97db0o5e4movPawY8UYM1zG`
+- Timestamp: `2026-04-15 00:55:40`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/util.py | sed -n '1,120p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 5000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_kumFcQwS2JKy8Pkt0MhtDWqa`
+- Timestamp: `2026-04-15 00:55:40`
+
+### Arguments
+```json
+{
+  "cmd": "rg -n \"def normalization|class GroupNorm32|def timestep_embedding|def conv_nd|def linear|def zero_module\" ldm/modules/diffusionmodules/util.py",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 3000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_t8nXP5mqDphr7CgjdAi0dqER`
+- Timestamp: `2026-04-15 00:55:40`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/attention.py | sed -n '196,290p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 5000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_h97db0o5e4movPawY8UYM1zG`
+- Timestamp: `2026-04-15 00:55:41`
+
+### Output
+```
+Chunk ID: 4ddbfb
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1434
+Output:
+     1	# adopted from
+     2	# https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+     3	# and
+     4	# https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
+     5	# and
+     6	# https://github.com/openai/guided-diffusion/blob/0ba878e517b276c45d1195eb29f6f5f72659a05b/guided_diffusion/nn.py
+     7	#
+     8	# thanks!
+     9	
+    10	
+    11	import os
+    12	import math
+    13	import torch
+    14	import torch.nn as nn
+    15	import numpy as np
+    16	from einops import repeat
+    17	
+    18	from ldm.util import instantiate_from_config
+    19	
+    20	
+    21	def make_beta_schedule(schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
+    22	    if schedule == "linear":
+    23	        betas = (
+    24	                torch.linspace(linear_start ** 0.5, linear_end ** 0.5, n_timestep, dtype=torch.float64) ** 2
+    25	        )
+    26	
+    27	    elif schedule == "cosine":
+    28	        timesteps = (
+    29	                torch.arange(n_timestep + 1, dtype=torch.float64) / n_timestep + cosine_s
+    30	        )
+    31	        alphas = timesteps / (1 + cosine_s) * np.pi / 2
+    32	        alphas = torch.cos(alphas).pow(2)
+    33	        alphas = alphas / alphas[0]
+    34	        betas = 1 - alphas[1:] / alphas[:-1]
+    35	        betas = np.clip(betas, a_min=0, a_max=0.999)
+    36	
+    37	    elif schedule == "sqrt_linear":
+    38	        betas = torch.linspace(linear_start, linear_end, n_timestep, dtype=torch.float64)
+    39	    elif schedule == "sqrt":
+    40	        betas = torch.linspace(linear_start, linear_end, n_timestep, dtype=torch.float64) ** 0.5
+    41	    else:
+    42	        raise ValueError(f"schedule '{schedule}' unknown.")
+    43	    return betas.numpy()
+    44	
+    45	
+    46	def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps, verbose=True):
+    47	    if ddim_discr_method == 'uniform':
+    48	        c = num_ddpm_timesteps // num_ddim_timesteps
+    49	        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    50	    elif ddim_discr_method == 'quad':
+    51	        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    52	    else:
+    53	        raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+    54	
+    55	    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    56	    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    57	    steps_out = ddim_timesteps + 1
+    58	    if verbose:
+    59	        print(f'Selected timesteps for ddim sampler: {steps_out}')
+    60	    return steps_out
+    61	
+    62	
+    63	def make_ddim_sampling_parameters(alphacums, ddim_timesteps, eta, verbose=True):
+    64	    # select alphas for computing the variance schedule
+    65	    alphas = alphacums[ddim_timesteps]
+    66	    alphas_prev = np.asarray([alphacums[0]] + alphacums[ddim_timesteps[:-1]].tolist())
+    67	
+    68	    # according the the formula provided in https://arxiv.org/abs/2010.02502
+    69	    sigmas = eta * np.sqrt((1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev))
+    70	    if verbose:
+    71	        print(f'Selected alphas for ddim sampler: a_t: {alphas}; a_(t-1): {alphas_prev}')
+    72	        print(f'For the chosen value of eta, which is {eta}, '
+    73	              f'this results in the following sigma_t schedule for ddim sampler {sigmas}')
+    74	    return sigmas, alphas, alphas_prev
+    75	
+    76	
+    77	def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
+    78	    """
+    79	    Create a beta schedule that discretizes the given alpha_t_bar function,
+    80	    which defines the cumulative product of (1-beta) over time from t = [0,1].
+    81	    :param num_diffusion_timesteps: the number of betas to produce.
+    82	    :param alpha_bar: a lambda that takes an argument t from 0 to 1 and
+    83	                      produces the cumulative product of (1-beta) up to that
+    84	                      part of the diffusion process.
+    85	    :param max_beta: the maximum beta to use; use values lower than 1 to
+    86	                     prevent singularities.
+    87	    """
+    88	    betas = []
+    89	    for i in range(num_diffusion_timesteps):
+    90	        t1 = i / num_diffusion_timesteps
+    91	        t2 = (i + 1) / num_diffusion_timesteps
+    92	        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    93	    return np.array(betas)
+    94	
+    95	
+    96	def extract_into_tensor(a, t, x_shape):
+    97	    b, *_ = t.shape
+    98	    out = a.gather(-1, t)
+    99	    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+   100	
+   101	
+   102	def checkpoint(func, inputs, params, flag):
+   103	    """
+   104	    Evaluate a function without caching intermediate activations, allowing for
+   105	    reduced memory at the expense of extra compute in the backward pass.
+   106	    :param func: the function to evaluate.
+   107	    :param inputs: the argument sequence to pass to `func`.
+   108	    :param params: a sequence of parameters `func` depends on but does not
+   109	                   explicitly take as arguments.
+   110	    :param flag: if False, disable gradient checkpointing.
+   111	    """
+   112	    if flag:
+   113	        args = tuple(inputs) + tuple(params)
+   114	        return CheckpointFunction.apply(func, len(inputs), *args)
+   115	    else:
+   116	        return func(*inputs)
+   117	
+   118	
+   119	class CheckpointFunction(torch.autograd.Function):
+   120	    @staticmethod
+
+```
+
+## [tool output]
+- Call ID: `call_kumFcQwS2JKy8Pkt0MhtDWqa`
+- Timestamp: `2026-04-15 00:55:41`
+
+### Output
+```
+Chunk ID: ea48ee
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 64
+Output:
+151:def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
+174:def zero_module(module):
+199:def normalization(channels):
+214:class GroupNorm32(nn.GroupNorm):
+218:def conv_nd(dims, *args, **kwargs):
+231:def linear(*args, **kwargs):
+
+```
+
+### Output
+```
+Chunk ID: 8dea35
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 801
+Output:
+   196	class BasicTransformerBlock(nn.Module):
+   197	    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+   198	        super().__init__()
+   199	        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+   200	        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+   201	        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
+   202	                                    heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+   203	        self.norm1 = nn.LayerNorm(dim)
+   204	        self.norm2 = nn.LayerNorm(dim)
+   205	        self.norm3 = nn.LayerNorm(dim)
+   206	        self.checkpoint = checkpoint
+   207	
+   208	    def forward(self, x, context=None):
+   209	        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+   210	
+   211	    def _forward(self, x, context=None):
+   212	        x = self.attn1(self.norm1(x)) + x
+   213	        x = self.attn2(self.norm2(x), context=context) + x
+   214	        x = self.ff(self.norm3(x)) + x
+   215	        return x
+   216	
+   217	
+   218	class SpatialTransformer(nn.Module):
+   219	    """
+   220	    Transformer block for image-like data.
+   221	    First, project the input (aka embedding)
+   222	    and reshape to b, t, d.
+   223	    Then apply standard transformer action.
+   224	    Finally, reshape to image
+   225	    """
+   226	    def __init__(self, in_channels, n_heads, d_head,
+   227	                 depth=1, dropout=0., context_dim=None):
+   228	        super().__init__()
+   229	        self.in_channels = in_channels
+   230	        inner_dim = n_heads * d_head
+   231	        self.norm = Normalize(in_channels)
+   232	
+   233	        self.proj_in = nn.Conv2d(in_channels,
+   234	                                 inner_dim,
+   235	                                 kernel_size=1,
+   236	                                 stride=1,
+   237	                                 padding=0)
+   238	
+   239	        self.transformer_blocks = nn.ModuleList(
+   240	            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+   241	                for d in range(depth)]
+   242	        )
+   243	
+   244	        self.proj_out = zero_module(nn.Conv2d(inner_dim,
+   245	                                              in_channels,
+   246	                                              kernel_size=1,
+   247	                                              stride=1,
+   248	                                              padding=0))
+   249	
+   250	    def forward(self, x, context=None):
+   251	        # note: if no context is given, cross-attention defaults to self-attention
+   252	        b, c, h, w = x.shape
+   253	        x_in = x
+   254	        x = self.norm(x)
+   255	        x = self.proj_in(x)
+   256	        x = rearrange(x, 'b c h w -> b (h w) c')
+   257	        for block in self.transformer_blocks:
+   258	            x = block(x, context=context)
+   259	        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+   260	        x = self.proj_out(x)
+   261	        return x + x_in
+
+```
+
+## [#74] Assistant
+- Timestamp: `2026-04-15 00:55:55`
+
+我再补两块关键信息：这个实现里的时间步嵌入和归一化工具，以及 SD v1 实际上用的是 `SpatialTransformer` 而不是老式 `AttentionBlock`。这两点不讲清楚，`UNetModel` 的“为什么这么拼”会少一半背景。
+
+## [tool] exec_command
+- Call ID: `call_7Dd3RLuFx2tRZ9E6AltiYa13`
+- Timestamp: `2026-04-15 00:55:55`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/util.py | sed -n '145,240p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 5000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_rPfGjXqUPCf0BWGismv1kGnd`
+- Timestamp: `2026-04-15 00:55:55`
+
+### Arguments
+```json
+{
+  "cmd": "rg -n \"class DiffusionWrapper|conditioning_key == 'crossattn'|out = self.diffusion_model\\(x, t, context=cc\\)\" ldm/models/diffusion/ddpm.py",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 3000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_65s1ZxYkAMKYFDVj1jJTA93G`
+- Timestamp: `2026-04-15 00:55:55`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/models/diffusion/ddpm.py | sed -n '1395,1420p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 3000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_7Dd3RLuFx2tRZ9E6AltiYa13`
+- Timestamp: `2026-04-15 00:55:55`
+
+### Output
+```
+Chunk ID: f05b61
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 829
+Output:
+   145	        del ctx.input_tensors
+   146	        del ctx.input_params
+   147	        del output_tensors
+   148	        return (None, None) + input_grads
+   149	
+   150	
+   151	def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
+   152	    """
+   153	    Create sinusoidal timestep embeddings.
+   154	    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+   155	                      These may be fractional.
+   156	    :param dim: the dimension of the output.
+   157	    :param max_period: controls the minimum frequency of the embeddings.
+   158	    :return: an [N x dim] Tensor of positional embeddings.
+   159	    """
+   160	    if not repeat_only:
+   161	        half = dim // 2
+   162	        freqs = torch.exp(
+   163	            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+   164	        ).to(device=timesteps.device)
+   165	        args = timesteps[:, None].float() * freqs[None]
+   166	        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+   167	        if dim % 2:
+   168	            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+   169	    else:
+   170	        embedding = repeat(timesteps, 'b -> b d', d=dim)
+   171	    return embedding
+   172	
+   173	
+   174	def zero_module(module):
+   175	    """
+   176	    Zero out the parameters of a module and return it.
+   177	    """
+   178	    for p in module.parameters():
+   179	        p.detach().zero_()
+   180	    return module
+   181	
+   182	
+   183	def scale_module(module, scale):
+   184	    """
+   185	    Scale the parameters of a module and return it.
+   186	    """
+   187	    for p in module.parameters():
+   188	        p.detach().mul_(scale)
+   189	    return module
+   190	
+   191	
+   192	def mean_flat(tensor):
+   193	    """
+   194	    Take the mean over all non-batch dimensions.
+   195	    """
+   196	    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+   197	
+   198	
+   199	def normalization(channels):
+   200	    """
+   201	    Make a standard normalization layer.
+   202	    :param channels: number of input channels.
+   203	    :return: an nn.Module for normalization.
+   204	    """
+   205	    return GroupNorm32(32, channels)
+   206	
+   207	
+   208	# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
+   209	class SiLU(nn.Module):
+   210	    def forward(self, x):
+   211	        return x * torch.sigmoid(x)
+   212	
+   213	
+   214	class GroupNorm32(nn.GroupNorm):
+   215	    def forward(self, x):
+   216	        return super().forward(x.float()).type(x.dtype)
+   217	
+   218	def conv_nd(dims, *args, **kwargs):
+   219	    """
+   220	    Create a 1D, 2D, or 3D convolution module.
+   221	    """
+   222	    if dims == 1:
+   223	        return nn.Conv1d(*args, **kwargs)
+   224	    elif dims == 2:
+   225	        return nn.Conv2d(*args, **kwargs)
+   226	    elif dims == 3:
+   227	        return nn.Conv3d(*args, **kwargs)
+   228	    raise ValueError(f"unsupported dimensions: {dims}")
+   229	
+   230	
+   231	def linear(*args, **kwargs):
+   232	    """
+   233	    Create a linear module.
+   234	    """
+   235	    return nn.Linear(*args, **kwargs)
+   236	
+   237	
+   238	def avg_pool_nd(dims, *args, **kwargs):
+   239	    """
+   240	    Create a 1D, 2D, or 3D average pooling module.
+
+```
+
+## [tool output]
+- Call ID: `call_rPfGjXqUPCf0BWGismv1kGnd`
+- Timestamp: `2026-04-15 00:55:55`
+
+### Output
+```
+Chunk ID: 6ae1d6
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 42
+Output:
+1394:class DiffusionWrapper(pl.LightningModule):
+1407:        elif self.conditioning_key == 'crossattn':
+1409:            out = self.diffusion_model(x, t, context=cc)
+
+```
+
+### Output
+```
+Chunk ID: 1c0d56
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 336
+Output:
+  1395	    def __init__(self, diff_model_config, conditioning_key):
+  1396	        super().__init__()
+  1397	        self.diffusion_model = instantiate_from_config(diff_model_config)
+  1398	        self.conditioning_key = conditioning_key
+  1399	        assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
+  1400	
+  1401	    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
+  1402	        if self.conditioning_key is None:
+  1403	            out = self.diffusion_model(x, t)
+  1404	        elif self.conditioning_key == 'concat':
+  1405	            xc = torch.cat([x] + c_concat, dim=1)
+  1406	            out = self.diffusion_model(xc, t)
+  1407	        elif self.conditioning_key == 'crossattn':
+  1408	            cc = torch.cat(c_crossattn, 1)
+  1409	            out = self.diffusion_model(x, t, context=cc)
+  1410	        elif self.conditioning_key == 'hybrid':
+  1411	            xc = torch.cat([x] + c_concat, dim=1)
+  1412	            cc = torch.cat(c_crossattn, 1)
+  1413	            out = self.diffusion_model(xc, t, context=cc)
+  1414	        elif self.conditioning_key == 'adm':
+  1415	            cc = c_crossattn[0]
+  1416	            out = self.diffusion_model(x, t, y=cc)
+  1417	        else:
+  1418	            raise NotImplementedError()
+  1419	
+  1420	        return out
+
+```
+
+## [#75] Assistant
+- Timestamp: `2026-04-15 00:58:00`
+
+**定位**
+
+这个 [`UNetModel`](<PATH>) 是整个扩散模型里最核心的去噪网络。
+在 Stable Diffusion v1 里，它不是处理像素图，而是处理 **VAE latent**，也就是形如 `B x 4 x 64 x 64` 的潜空间特征。
+
+它在配置里是这样被实例化的：
+[v1-inference.yaml#L29](<PATH>)
+
+```yaml
+unet_config:
+  target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+  params:
+    in_channels: 4
+    out_channels: 4
+    model_channels: 320
+    attention_resolutions: [4, 2, 1]
+    num_res_blocks: 2
+    channel_mult: [1, 2, 4, 4]
+    num_heads: 8
+    use_spatial_transformer: True
+    transformer_depth: 1
+    context_dim: 768
+```
+
+所以 SD v1 用的是：
+
+- latent 输入通道 `4`
+- 基础通道数 `320`
+- 每层 2 个 ResBlock
+- 通道倍率 `[1,2,4,4]`
+- 在若干分辨率处插 attention / transformer
+- 文本条件通过 cross-attention 注入
+
+---
+
+## 一、先说它“到底是什么结构”
+
+这个网络本质上是：
+
+> **U-Net + 时间步嵌入 + ResBlock + 注意力/Transformer + 跳连**
+
+可以画成：
+
+```text
+x_t
+ -> 输入卷积
+ -> 下采样路径 input_blocks
+ -> 中间瓶颈 middle_block
+ -> 上采样路径 output_blocks
+ -> 输出卷积
+ -> 预测噪声 / 预测 x0
+```
+
+其中：
+
+- 下采样路径负责提取多尺度特征
+- 上采样路径负责逐步恢复分辨率
+- skip connection 把浅层细节送到上采样端
+- timestep embedding 告诉网络当前是第几个扩散步
+- context 通过 cross-attention 注入文本条件
+
+---
+
+## 二、它依赖的几个基础块
+
+在讲 `UNetModel` 之前，先看它拼积木用的基础模块。
+
+### 1. `TimestepEmbedSequential`
+
+定义在：
+[openaimodel.py#L74](<PATH>)
+
+它的作用是：
+
+- 如果子层是 `TimestepBlock`，就传入 `emb`
+- 如果子层是 `SpatialTransformer`，就传入 `context`
+- 普通层就只传 `x`
+
+也就是说它是一个“带条件路由能力的 Sequential”。
+
+这点非常关键，因为在这个 U-Net 里有两种条件：
+
+- 时间步条件 `emb`
+- 文本条件 `context`
+
+---
+
+### 2. `ResBlock`
+
+定义在：
+[openaimodel.py#L163](<PATH>)
+
+它是这个网络最常见的卷积残差块。
+
+结构上可以写成：
+
+\[
+h = \mathrm{Conv}(\mathrm{SiLU}(\mathrm{Norm}(x)))
+\]
+
+然后把时间步嵌入映射到通道维并加进去：
+
+\[
+h = h + W_e \cdot \phi(e_t)
+\]
+
+再过第二段：
+
+\[
+h = \mathrm{Conv}(\mathrm{Dropout}(\mathrm{SiLU}(\mathrm{Norm}(h))))
+\]
+
+最后残差相加：
+
+\[
+y = \mathrm{skip}(x) + h
+\]
+
+代码里对应的关键点：
+
+- 输入分支
+  [openaimodel.py#L201](<PATH>)
+
+- 时间步嵌入映射
+  [openaimodel.py#L218](<PATH>)
+
+- 把 `emb` broadcast 到空间维
+  [openaimodel.py#L264](<PATH>)
+
+- 残差输出
+  [openaimodel.py#L275](<PATH>)
+
+它对应的是 diffusion/ADM 风格的 residual block，不是教科书原版 ResNet block。
+
+相关来源：
+- ResNet: He et al., 2015
+- DDPM / guided-diffusion / ADM 工程变体：Ho et al., 2020；Dhariwal & Nichol, 2021
+
+---
+
+### 3. `AttentionBlock`
+
+定义在：
+[openaimodel.py#L278](<PATH>)
+
+这是老式的空间 self-attention 块。
+它把 feature map reshape 成序列，然后做 QKV attention：
+
+\[
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)V
+\]
+
+实现里又分成：
+
+- `QKVAttentionLegacy`
+  [openaimodel.py#L347](<PATH>)
+
+- `QKVAttention`
+  [openaimodel.py#L379](<PATH>)
+
+但要注意：
+
+**Stable Diffusion v1 默认并不走这个 `AttentionBlock`。**
+
+---
+
+### 4. `SpatialTransformer`
+
+定义在：
+[attention.py#L218](<PATH>)
+
+当配置里：
+
+```yaml
+use_spatial_transformer: True
+context_dim: 768
+```
+
+时，`UNetModel` 会在 attention 位置插入 `SpatialTransformer`，而不是 `AttentionBlock`。
+
+它的逻辑是：
+
+1. 把 `B x C x H x W` 投影到 transformer 内部维度
+2. reshape 成序列 `B x (HW) x D`
+3. 做若干层 `BasicTransformerBlock`
+4. 再 reshape 回 feature map
+
+其中 `BasicTransformerBlock`：
+[attention.py#L196](<PATH>)
+
+内部是：
+
+- 一层 self-attention
+- 一层 cross-attention
+- 一层 feed-forward
+
+关键是 cross-attention：
+
+\[
+\mathrm{CrossAttn}(X, C)=\mathrm{softmax}\left(\frac{Q(X)K(C)^\top}{\sqrt{d}}\right)V(C)
+\]
+
+这里：
+
+- `X` 来自图像 latent feature
+- `C` 来自文本 encoder 输出的 token embedding
+
+这正是 Stable Diffusion 文本条件注入的核心。
+
+来源：
+- Transformer: Vaswani et al., 2017
+- Latent Diffusion cross-attention: Rombach et al., 2022
+
+---
+
+## 三、`UNetModel.__init__()` 在搭什么网络
+
+构造函数在：
+[openaimodel.py#L443](<PATH>)
+
+整体分成 5 部分：
+
+1. 时间步嵌入 `time_embed`
+2. 输入块 `input_blocks`
+3. 中间块 `middle_block`
+4. 输出块 `output_blocks`
+5. 最终输出层 `out`
+
+---
+
+## 四、时间步嵌入是怎么进来的
+
+### 1. 先做 sinusoidal embedding
+
+在 forward 里：
+[openaimodel.py#L723](<PATH>)
+
+```python
+t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+```
+
+`timestep_embedding` 定义在：
+[util.py#L151](<PATH>)
+
+它本质上是 Transformer 风格的正弦位置编码：
+
+\[
+\text{emb}_{2i}(t)=\cos\left(t / 10000^{2i/d}\right)
+\]
+\[
+\text{emb}_{2i+1}(t)=\sin\left(t / 10000^{2i/d}\right)
+\]
+
+### 2. 再过一个两层 MLP
+
+定义在：
+[openaimodel.py#L506](<PATH>)
+
+```python
+self.time_embed = nn.Sequential(
+    linear(model_channels, time_embed_dim),
+    nn.SiLU(),
+    linear(time_embed_dim, time_embed_dim),
+)
+```
+
+其中：
+
+\[
+time\_embed\_dim = 4 \times model\_channels
+\]
+
+对 SD v1 来说：
+
+\[
+4 \times 320 = 1280
+\]
+
+所以每个时间步最后得到一个 `1280` 维向量，注入所有 ResBlock。
+
+---
+
+## 五、输入路径 `input_blocks`
+
+定义从：
+[openaimodel.py#L516](<PATH>)
+
+### 1. 第一层是输入卷积
+
+```python
+conv_nd(dims, in_channels, model_channels, 3, padding=1)
+```
+
+对于 SD v1：
+
+- `in_channels = 4`
+- `model_channels = 320`
+
+所以：
+
+```text
+4 -> 320
+```
+
+---
+
+### 2. 然后按 `channel_mult` 和 `num_res_blocks` 堆层
+
+关键循环在：
+[openaimodel.py#L527](<PATH>)
+
+它的逻辑是：
+
+- 每个 level 堆 `num_res_blocks` 个 `ResBlock`
+- 某些下采样倍率 `ds` 上插 attention/transformer
+- 每个 level 末尾做下采样，除了最后一层
+
+其中：
+
+- `ch` 表示当前通道数
+- `ds` 表示相对输入的下采样倍率
+- `input_block_chans` 记录 skip connection 需要的通道数
+
+---
+
+## 六、SD v1 默认配置下，输入路径的实际结构
+
+要注意：这里 U-Net 处理的是 latent，不是 512x512 像素图。
+对于 512x512 输入图，经 VAE 压缩后 latent 是 `64x64`。
+
+虽然配置里 `unet_config.image_size: 32` 注释说 unused，但实际输入分辨率由外部 latent 决定。
+
+### 初始输入
+
+```text
+x_t: B x 4 x 64 x 64
+```
+
+### 进入第一层卷积
+
+```text
+B x 4 x 64 x 64 -> B x 320 x 64 x 64
+```
+
+### level 0, `mult=1`, `ds=1`
+- ResBlock: `320 -> 320`
+- SpatialTransformer
+- ResBlock: `320 -> 320`
+- SpatialTransformer
+- Downsample: `64 -> 32`
+
+输出：
+
+```text
+B x 320 x 32 x 32
+```
+
+### level 1, `mult=2`, `ds=2`
+- ResBlock: `320 -> 640`
+- SpatialTransformer
+- ResBlock: `640 -> 640`
+- SpatialTransformer
+- Downsample: `32 -> 16`
+
+输出：
+
+```text
+B x 640 x 16 x 16
+```
+
+### level 2, `mult=4`, `ds=4`
+- ResBlock: `640 -> 1280`
+- SpatialTransformer
+- ResBlock: `1280 -> 1280`
+- SpatialTransformer
+- Downsample: `16 -> 8`
+
+输出：
+
+```text
+B x 1280 x 8 x 8
+```
+
+### level 3, `mult=4`, `ds=8`
+- ResBlock: `1280 -> 1280`
+- ResBlock: `1280 -> 1280`
+
+这里因为 `attention_resolutions = [4,2,1]`，不包含 `8`，所以最深层默认不插 attention。
+
+输出：
+
+```text
+B x 1280 x 8 x 8
+```
+
+---
+
+## 七、中间块 `middle_block`
+
+定义在：
+[openaimodel.py#L597](<PATH>)
+
+结构是：
+
+- ResBlock
+- AttentionBlock 或 SpatialTransformer
+- ResBlock
+
+对于 SD v1，实际是：
+
+- `ResBlock(1280 -> 1280)`
+- `SpatialTransformer(1280, context_dim=768)`
+- `ResBlock(1280 -> 1280)`
+
+中间块的意义是：
+
+- 在最小分辨率处整合全局信息
+- 计算量相对低
+- 特别适合做 cross-attention
+
+---
+
+## 八、输出路径 `output_blocks`
+
+定义在：
+[openaimodel.py#L626](<PATH>)
+
+逻辑和下采样路径镜像，但有两个重要点：
+
+### 1. 每一步先和 skip feature 拼接
+
+在 forward 中：
+
+[openaimodel.py#L735](<PATH>)
+
+```python
+h = th.cat([h, hs.pop()], dim=1)
+```
+
+也就是：
+
+\[
+h \leftarrow \mathrm{concat}(h,\ skip)
+\]
+
+这就是 U-Net 的核心跳连。
+
+### 2. 每个 level 有 `num_res_blocks + 1` 个 block
+
+因为输出端每个 level 不只是“对称还原”，还要消化从 skip 接进来的额外特征，所以这里是 `+1`。
+
+---
+
+## 九、为什么 skip connection 很重要
+
+U-Net 最关键的不是“下去再上来”，而是：
+
+> 编码器浅层的高分辨率信息，不在 bottleneck 里丢掉，而是直接接给解码器。
+
+这可以缓解两个问题：
+
+- 高分辨率细节在深层被压缩丢失
+- 解码器只靠 bottleneck 很难恢复局部结构
+
+所以输出路径不是单纯上采样，而是：
+
+\[
+h_{up}^{(l)} = f\left([h_{up}^{(l+1)}, h_{down}^{(l)}]\right)
+\]
+
+这就是 skip connection 的数学表达。
+
+来源：
+- U-Net: Ronneberger et al., 2015
+
+---
+
+## 十、最终输出层 `out`
+
+定义在：
+[openaimodel.py#L682](<PATH>)
+
+```python
+self.out = nn.Sequential(
+    normalization(ch),
+    nn.SiLU(),
+    zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
+)
+```
+
+对于 SD v1：
+
+```text
+320 -> 4
+```
+
+所以最终输出 shape 和输入 latent 一致：
+
+```text
+B x 4 x 64 x 64
+```
+
+这正好适合做：
+
+- 预测噪声 `epsilon`
+- 或预测 `x0`
+- 或其他等价参数化
+
+### 为什么用 `zero_module`
+
+`zero_module` 在：
+[util.py#L174](<PATH>)
+
+它会把最后一层卷积参数初始化为 0。
+
+这意味着模型刚开始训练时，输出接近 0，更稳定。
+这是 diffusion/残差网络里常见的稳定训练技巧。
+
+---
+
+## 十一、forward 真正怎么走
+
+forward 在：
+[openaimodel.py#L710](<PATH>)
+
+### 第一步：时间步嵌入
+
+```python
+t_emb = timestep_embedding(timesteps, self.model_channels)
+emb = self.time_embed(t_emb)
+```
+
+### 第二步：如果是类条件，就加 label embedding
+
+```python
+if self.num_classes is not None:
+    emb = emb + self.label_emb(y)
+```
+
+但 SD v1 不走这个分支。
+
+### 第三步：输入路径
+
+```python
+for module in self.input_blocks:
+    h = module(h, emb, context)
+    hs.append(h)
+```
+
+注意这里每走完一个模块都把 `h` 存起来，作为 skip。
+
+### 第四步：中间块
+
+```python
+h = self.middle_block(h, emb, context)
+```
+
+### 第五步：输出路径
+
+```python
+for module in self.output_blocks:
+    h = th.cat([h, hs.pop()], dim=1)
+    h = module(h, emb, context)
+```
+
+### 第六步：输出层
+
+```python
+return self.out(h)
+```
+
+---
+
+## 十二、在 Stable Diffusion 里，文本条件是怎么进来的
+
+这里非常关键。
+
+`UNetModel.forward()` 接收：
+
+```python
+forward(self, x, timesteps=None, context=None, y=None, **kwargs)
+```
+
+其中：
+
+- `x` 是 noisy latent `z_t`
+- `timesteps` 是扩散步 `t`
+- `context` 是文本 embedding
+
+`context` 是从外层传进来的。
+在 `DiffusionWrapper` 里：
+
+[ddpm.py#L1407](<PATH>)
+
+```python
+elif self.conditioning_key == 'crossattn':
+    cc = torch.cat(c_crossattn, 1)
+    out = self.diffusion_model(x, t, context=cc)
+```
+
+所以 SD v1 的文本条件链是：
+
+```text
+text prompt
+ -> CLIP text encoder
+ -> context: B x 77 x 768
+ -> SpatialTransformer 里的 cross-attention
+ -> UNet feature 被文本调制
+```
+
+这就是 Stable Diffusion 和传统无条件 DDPM/ADM 的最大区别之一。
+
+---
+
+## 十三、这个实现和“经典 U-Net”相比有哪些扩展
+
+### 1. 多了时间步条件
+普通 U-Net 没有 `timestep embedding`。
+这里每个 ResBlock 都被时间步条件调制。
+
+### 2. 多了 attention / transformer
+普通 U-Net 主要是卷积。
+这里在若干尺度上引入全局依赖建模。
+
+### 3. 多了 cross-attention 文本条件
+这使它能做 text-to-image。
+
+### 4. 多了梯度 checkpoint
+`use_checkpoint=True` 时，节省显存，代价是增加反向计算。
+
+### 5. 支持 `resblock_updown`
+可选择用 ResBlock 做上下采样，而不是单独采样层。
+
+---
+
+## 十四、这个实现主要来自哪些论文/代码系
+
+它不是某一篇论文的纯净复现，而是几条路线融合后的工程版本：
+
+- U-Net 基本形态
+  Ronneberger et al., *U-Net* (2015)
+
+- DDPM / diffusion UNet with timestep embedding
+  Ho et al., *DDPM* (2020)
+
+- OpenAI guided-diffusion / ADM 风格残差块、attention、时间步注入
+  Dhariwal & Nichol, *Diffusion Models Beat GANs on Image Synthesis* (2021)
+
+- Transformer / cross-attention
+  Vaswani et al., *Attention Is All You Need* (2017)
+
+- Stable Diffusion / LDM 的 latent cross-attention 设计
+  Rombach et al., *High-Resolution Image Synthesis with Latent Diffusion Models* (2022)
+
+代码注释里也能看到它明显承袭了 OpenAI 那条实现路线，比如 `AttentionBlock` 注释直接提到了 Ho 的 diffusion_tf 代码：
+[openaimodel.py#L278](<PATH>)
+
+---
+
+## 十五、最关键的一句理解
+
+如果把这个网络压缩成一句话：
+
+> 它是一个在 latent 空间工作的、带时间步条件和文本 cross-attention 的多尺度 U-Net，用来预测当前 noisy latent 中的噪声成分。
+
+也就是学这个函数：
+
+\[
+\epsilon_\theta(z_t, t, c)
+\]
+
+其中：
+
+- \(z_t\)：第 `t` 步的 noisy latent
+- \(t\)：时间步
+- \(c\)：文本条件
+- 输出仍然是和 latent 同形状的张量
+
+---
+
+## 十六、按 SD v1 默认配置给你一张“结构地图”
+
+```text
+Input:
+B x 4 x 64 x 64
+
+Stem:
+Conv 4 -> 320
+
+Down path:
+[320 -> 320 + ST] x2, down -> 32x32
+[320 -> 640 + ST] x2, down -> 16x16
+[640 -> 1280 + ST] x2, down -> 8x8
+[1280 -> 1280] x2
+
+Middle:
+ResBlock(1280)
+SpatialTransformer(1280, context=768)
+ResBlock(1280)
+
+Up path:
+skip concat + blocks + optional ST + upsample
+mirror back to 64x64
+
+Out:
+Norm -> SiLU -> Conv 320 -> 4
+```
+
+这里 `ST` 就是 `SpatialTransformer`。
+
+---
+
+如果你愿意，我下一步可以继续两种深入中的一种：
+
+1. 把 **SD v1 这套 UNet 每一个 input block / output block 的具体通道数和 skip 拼接维度** 全部列成表
+2. 单独把 [`ResBlock`](<PATH>) 和 [`SpatialTransformer`](<PATH>) 逐行拆开讲，因为这两个模块基本吃掉了 UNet 的大部分复杂度
+
+## [#76] User
+- Timestamp: `2026-04-15 01:09:58`
+
+# Context from my IDE setup:
+
+## Active file: ldm/modules/attention.py
+
+## Open tabs:
+- attention.py: ldm/modules/attention.py
+- openaimodel.py: ldm/modules/diffusionmodules/openaimodel.py
+- util.py: ldm/modules/diffusionmodules/util.py
+- ddpm.py: ldm/models/diffusion/ddpm.py
+- v1-inference.yaml: configs/stable-diffusion/v1-inference.yaml
+
+## My request for Codex:
+两个都进行详细讲解
+
+## [#77] Assistant
+- Timestamp: `2026-04-15 01:10:07`
+
+我把这两个模块拆成两条线讲：先讲 `ResBlock` 怎么把时间步嵌进卷积残差块，再讲 `SpatialTransformer` 怎么把二维特征图改造成可做 self/cross-attention 的序列。过程中我会把公式、shape 变化和 SD v1 的默认配置都一起对上。
+
+## [tool] exec_command
+- Call ID: `call_SqxLmzmEyJcZa3nbLDrXBq5g`
+- Timestamp: `2026-04-15 01:10:07`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/diffusionmodules/openaimodel.py | sed -n '163,276p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 7000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_QsTISCB1qf1Uzh7tSYfg30ZJ`
+- Timestamp: `2026-04-15 01:10:07`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba ldm/modules/attention.py | sed -n '1,290p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 12000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool] exec_command
+- Call ID: `call_YvQTpRIPQrNagHuAZ7kXq27l`
+- Timestamp: `2026-04-15 01:10:07`
+
+### Arguments
+```json
+{
+  "cmd": "nl -ba configs/stable-diffusion/v1-inference.yaml | sed -n '29,45p'",
+  "workdir": "/home/pei/workspace/projects/stable-diffusion",
+  "max_output_tokens": 2000,
+  "yield_time_ms": 1000
+}
+```
+
+## [tool output]
+- Call ID: `call_SqxLmzmEyJcZa3nbLDrXBq5g`
+- Timestamp: `2026-04-15 01:10:07`
+
+### Output
+```
+Chunk ID: 8fe517
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1195
+Output:
+   163	class ResBlock(TimestepBlock):
+   164	    """
+   165	    A residual block that can optionally change the number of channels.
+   166	    :param channels: the number of input channels.
+   167	    :param emb_channels: the number of timestep embedding channels.
+   168	    :param dropout: the rate of dropout.
+   169	    :param out_channels: if specified, the number of out channels.
+   170	    :param use_conv: if True and out_channels is specified, use a spatial
+   171	        convolution instead of a smaller 1x1 convolution to change the
+   172	        channels in the skip connection.
+   173	    :param dims: determines if the signal is 1D, 2D, or 3D.
+   174	    :param use_checkpoint: if True, use gradient checkpointing on this module.
+   175	    :param up: if True, use this block for upsampling.
+   176	    :param down: if True, use this block for downsampling.
+   177	    """
+   178	
+   179	    def __init__(
+   180	        self,
+   181	        channels,
+   182	        emb_channels,
+   183	        dropout,
+   184	        out_channels=None,
+   185	        use_conv=False,
+   186	        use_scale_shift_norm=False,
+   187	        dims=2,
+   188	        use_checkpoint=False,
+   189	        up=False,
+   190	        down=False,
+   191	    ):
+   192	        super().__init__()
+   193	        self.channels = channels
+   194	        self.emb_channels = emb_channels
+   195	        self.dropout = dropout
+   196	        self.out_channels = out_channels or channels
+   197	        self.use_conv = use_conv
+   198	        self.use_checkpoint = use_checkpoint
+   199	        self.use_scale_shift_norm = use_scale_shift_norm
+   200	
+   201	        self.in_layers = nn.Sequential(
+   202	            normalization(channels),
+   203	            nn.SiLU(),
+   204	            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+   205	        )
+   206	
+   207	        self.updown = up or down
+   208	
+   209	        if up:
+   210	            self.h_upd = Upsample(channels, False, dims)
+   211	            self.x_upd = Upsample(channels, False, dims)
+   212	        elif down:
+   213	            self.h_upd = Downsample(channels, False, dims)
+   214	            self.x_upd = Downsample(channels, False, dims)
+   215	        else:
+   216	            self.h_upd = self.x_upd = nn.Identity()
+   217	
+   218	        self.emb_layers = nn.Sequential(
+   219	            nn.SiLU(),
+   220	            linear(
+   221	                emb_channels,
+   222	                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+   223	            ),
+   224	        )
+   225	        self.out_layers = nn.Sequential(
+   226	            normalization(self.out_channels),
+   227	            nn.SiLU(),
+   228	            nn.Dropout(p=dropout),
+   229	            zero_module(
+   230	                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+   231	            ),
+   232	        )
+   233	
+   234	        if self.out_channels == channels:
+   235	            self.skip_connection = nn.Identity()
+   236	        elif use_conv:
+   237	            self.skip_connection = conv_nd(
+   238	                dims, channels, self.out_channels, 3, padding=1
+   239	            )
+   240	        else:
+   241	            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+   242	
+   243	    def forward(self, x, emb):
+   244	        """
+   245	        Apply the block to a Tensor, conditioned on a timestep embedding.
+   246	        :param x: an [N x C x ...] Tensor of features.
+   247	        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+   248	        :return: an [N x C x ...] Tensor of outputs.
+   249	        """
+   250	        return checkpoint(
+   251	            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+   252	        )
+   253	
+   254	
+   255	    def _forward(self, x, emb):
+   256	        if self.updown:
+   257	            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+   258	            h = in_rest(x)
+   259	            h = self.h_upd(h)
+   260	            x = self.x_upd(x)
+   261	            h = in_conv(h)
+   262	        else:
+   263	            h = self.in_layers(x)
+   264	        emb_out = self.emb_layers(emb).type(h.dtype)
+   265	        while len(emb_out.shape) < len(h.shape):
+   266	            emb_out = emb_out[..., None]
+   267	        if self.use_scale_shift_norm:
+   268	            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+   269	            scale, shift = th.chunk(emb_out, 2, dim=1)
+   270	            h = out_norm(h) * (1 + scale) + shift
+   271	            h = out_rest(h)
+   272	        else:
+   273	            h = h + emb_out
+   274	            h = self.out_layers(h)
+   275	        return self.skip_connection(x) + h
+   276	
+
+```
+
+## [tool output]
+- Call ID: `call_QsTISCB1qf1Uzh7tSYfg30ZJ`
+- Timestamp: `2026-04-15 01:10:07`
+
+### Output
+```
+Chunk ID: 0b527e
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 2590
+Output:
+     1	from inspect import isfunction
+     2	import math
+     3	import torch
+     4	import torch.nn.functional as F
+     5	from torch import nn, einsum
+     6	from einops import rearrange, repeat
+     7	
+     8	from ldm.modules.diffusionmodules.util import checkpoint
+     9	
+    10	
+    11	def exists(val):
+    12	    return val is not None
+    13	
+    14	
+    15	def uniq(arr):
+    16	    return{el: True for el in arr}.keys()
+    17	
+    18	
+    19	def default(val, d):
+    20	    if exists(val):
+    21	        return val
+    22	    return d() if isfunction(d) else d
+    23	
+    24	
+    25	def max_neg_value(t):
+    26	    return -torch.finfo(t.dtype).max
+    27	
+    28	
+    29	def init_(tensor):
+    30	    dim = tensor.shape[-1]
+    31	    std = 1 / math.sqrt(dim)
+    32	    tensor.uniform_(-std, std)
+    33	    return tensor
+    34	
+    35	
+    36	# feedforward
+    37	class GEGLU(nn.Module):
+    38	    def __init__(self, dim_in, dim_out):
+    39	        super().__init__()
+    40	        self.proj = nn.Linear(dim_in, dim_out * 2)
+    41	
+    42	    def forward(self, x):
+    43	        x, gate = self.proj(x).chunk(2, dim=-1)
+    44	        return x * F.gelu(gate)
+    45	
+    46	
+    47	class FeedForward(nn.Module):
+    48	    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+    49	        super().__init__()
+    50	        inner_dim = int(dim * mult)
+    51	        dim_out = default(dim_out, dim)
+    52	        project_in = nn.Sequential(
+    53	            nn.Linear(dim, inner_dim),
+    54	            nn.GELU()
+    55	        ) if not glu else GEGLU(dim, inner_dim)
+    56	
+    57	        self.net = nn.Sequential(
+    58	            project_in,
+    59	            nn.Dropout(dropout),
+    60	            nn.Linear(inner_dim, dim_out)
+    61	        )
+    62	
+    63	    def forward(self, x):
+    64	        return self.net(x)
+    65	
+    66	
+    67	def zero_module(module):
+    68	    """
+    69	    Zero out the parameters of a module and return it.
+    70	    """
+    71	    for p in module.parameters():
+    72	        p.detach().zero_()
+    73	    return module
+    74	
+    75	
+    76	def Normalize(in_channels):
+    77	    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+    78	
+    79	
+    80	class LinearAttention(nn.Module):
+    81	    def __init__(self, dim, heads=4, dim_head=32):
+    82	        super().__init__()
+    83	        self.heads = heads
+    84	        hidden_dim = dim_head * heads
+    85	        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+    86	        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+    87	
+    88	    def forward(self, x):
+    89	        b, c, h, w = x.shape
+    90	        qkv = self.to_qkv(x)
+    91	        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3)
+    92	        k = k.softmax(dim=-1)  
+    93	        context = torch.einsum('bhdn,bhen->bhde', k, v)
+    94	        out = torch.einsum('bhde,bhdn->bhen', context, q)
+    95	        out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
+    96	        return self.to_out(out)
+    97	
+    98	
+    99	class SpatialSelfAttention(nn.Module):
+   100	    def __init__(self, in_channels):
+   101	        super().__init__()
+   102	        self.in_channels = in_channels
+   103	
+   104	        self.norm = Normalize(in_channels)
+   105	        self.q = torch.nn.Conv2d(in_channels,
+   106	                                 in_channels,
+   107	                                 kernel_size=1,
+   108	                                 stride=1,
+   109	                                 padding=0)
+   110	        self.k = torch.nn.Conv2d(in_channels,
+   111	                                 in_channels,
+   112	                                 kernel_size=1,
+   113	                                 stride=1,
+   114	                                 padding=0)
+   115	        self.v = torch.nn.Conv2d(in_channels,
+   116	                                 in_channels,
+   117	                                 kernel_size=1,
+   118	                                 stride=1,
+   119	                                 padding=0)
+   120	        self.proj_out = torch.nn.Conv2d(in_channels,
+   121	                                        in_channels,
+   122	                                        kernel_size=1,
+   123	                                        stride=1,
+   124	                                        padding=0)
+   125	
+   126	    def forward(self, x):
+   127	        h_ = x
+   128	        h_ = self.norm(h_)
+   129	        q = self.q(h_)
+   130	        k = self.k(h_)
+   131	        v = self.v(h_)
+   132	
+   133	        # compute attention
+   134	        b,c,h,w = q.shape
+   135	        q = rearrange(q, 'b c h w -> b (h w) c')
+   136	        k = rearrange(k, 'b c h w -> b c (h w)')
+   137	        w_ = torch.einsum('bij,bjk->bik', q, k)
+   138	
+   139	        w_ = w_ * (int(c)**(-0.5))
+   140	        w_ = torch.nn.functional.softmax(w_, dim=2)
+   141	
+   142	        # attend to values
+   143	        v = rearrange(v, 'b c h w -> b c (h w)')
+   144	        w_ = rearrange(w_, 'b i j -> b j i')
+   145	        h_ = torch.einsum('bij,bjk->bik', v, w_)
+   146	        h_ = rearrange(h_, 'b c (h w) -> b c h w', h=h)
+   147	        h_ = self.proj_out(h_)
+   148	
+   149	        return x+h_
+   150	
+   151	
+   152	class CrossAttention(nn.Module):
+   153	    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+   154	        super().__init__()
+   155	        inner_dim = dim_head * heads
+   156	        context_dim = default(context_dim, query_dim)
+   157	
+   158	        self.scale = dim_head ** -0.5
+   159	        self.heads = heads
+   160	
+   161	        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+   162	        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+   163	        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+   164	
+   165	        self.to_out = nn.Sequential(
+   166	            nn.Linear(inner_dim, query_dim),
+   167	            nn.Dropout(dropout)
+   168	        )
+   169	
+   170	    def forward(self, x, context=None, mask=None):
+   171	        h = self.heads
+   172	
+   173	        q = self.to_q(x)
+   174	        context = default(context, x)
+   175	        k = self.to_k(context)
+   176	        v = self.to_v(context)
+   177	
+   178	        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+   179	
+   180	        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+   181	
+   182	        if exists(mask):
+   183	            mask = rearrange(mask, 'b ... -> b (...)')
+   184	            max_neg_value = -torch.finfo(sim.dtype).max
+   185	            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+   186	            sim.masked_fill_(~mask, max_neg_value)
+   187	
+   188	        # attention, what we cannot get enough of
+   189	        attn = sim.softmax(dim=-1)
+   190	
+   191	        out = einsum('b i j, b j d -> b i d', attn, v)
+   192	        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+   193	        return self.to_out(out)
+   194	
+   195	
+   196	class BasicTransformerBlock(nn.Module):
+   197	    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+   198	        super().__init__()
+   199	        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+   200	        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+   201	        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
+   202	                                    heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+   203	        self.norm1 = nn.LayerNorm(dim)
+   204	        self.norm2 = nn.LayerNorm(dim)
+   205	        self.norm3 = nn.LayerNorm(dim)
+   206	        self.checkpoint = checkpoint
+   207	
+   208	    def forward(self, x, context=None):
+   209	        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+   210	
+   211	    def _forward(self, x, context=None):
+   212	        x = self.attn1(self.norm1(x)) + x
+   213	        x = self.attn2(self.norm2(x), context=context) + x
+   214	        x = self.ff(self.norm3(x)) + x
+   215	        return x
+   216	
+   217	
+   218	class SpatialTransformer(nn.Module):
+   219	    """
+   220	    Transformer block for image-like data.
+   221	    First, project the input (aka embedding)
+   222	    and reshape to b, t, d.
+   223	    Then apply standard transformer action.
+   224	    Finally, reshape to image
+   225	    """
+   226	    def __init__(self, in_channels, n_heads, d_head,
+   227	                 depth=1, dropout=0., context_dim=None):
+   228	        super().__init__()
+   229	        self.in_channels = in_channels
+   230	        inner_dim = n_heads * d_head
+   231	        self.norm = Normalize(in_channels)
+   232	
+   233	        self.proj_in = nn.Conv2d(in_channels,
+   234	                                 inner_dim,
+   235	                                 kernel_size=1,
+   236	                                 stride=1,
+   237	                                 padding=0)
+   238	
+   239	        self.transformer_blocks = nn.ModuleList(
+   240	            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+   241	                for d in range(depth)]
+   242	        )
+   243	
+   244	        self.proj_out = zero_module(nn.Conv2d(inner_dim,
+   245	                                              in_channels,
+   246	                                              kernel_size=1,
+   247	                                              stride=1,
+   248	                                              padding=0))
+   249	
+   250	    def forward(self, x, context=None):
+   251	        # note: if no context is given, cross-attention defaults to self-attention
+   252	        b, c, h, w = x.shape
+   253	        x_in = x
+   254	        x = self.norm(x)
+   255	        x = self.proj_in(x)
+   256	        x = rearrange(x, 'b c h w -> b (h w) c')
+   257	        for block in self.transformer_blocks:
+   258	            x = block(x, context=context)
+   259	        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+   260	        x = self.proj_out(x)
+   261	        return x + x_in
+
+```
+
+### Output
+```
+Chunk ID: f00298
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 149
+Output:
+    29	    unet_config:
+    30	      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+    31	      params:
+    32	        image_size: 32 # unused
+    33	        in_channels: 4
+    34	        out_channels: 4
+    35	        model_channels: 320
+    36	        attention_resolutions: [ 4, 2, 1 ]
+    37	        num_res_blocks: 2
+    38	        channel_mult: [ 1, 2, 4, 4 ]
+    39	        num_heads: 8
+    40	        use_spatial_transformer: True
+    41	        transformer_depth: 1
+    42	        context_dim: 768
+    43	        use_checkpoint: True
+    44	        legacy: False
+    45	
+
+```
+
+## [#78] Assistant
+- Timestamp: `2026-04-15 01:11:51`
+
+这两个模块确实是这个 U-Net 里最值得啃透的部分。
+可以先把它们的职责分开记：
+
+- [`ResBlock`](<PATH>) 负责“局部卷积建模 + 时间步条件注入 + 残差连接”
+- [`SpatialTransformer`](<PATH>) 负责“把二维特征图变成序列，在上面做 self-attention / cross-attention，再还原回特征图”
+
+在 Stable Diffusion v1 默认配置里：
+[v1-inference.yaml#L29](<PATH>)
+
+- `model_channels = 320`
+- `num_heads = 8`
+- `use_spatial_transformer = True`
+- `transformer_depth = 1`
+- `context_dim = 768`
+
+这意味着：
+
+- 每个 `ResBlock` 接收 `1280` 维时间步嵌入
+- attention 位置用的是 `SpatialTransformer`
+- 文本条件是 CLIP 输出的 `768` 维 token embedding
+
+---
+
+**先给整体图**
+
+在 SD 的 U-Net 里，一个典型 block stack 长这样：
+
+```text
+x
+-> ResBlock(x, temb)
+-> SpatialTransformer(x, context)
+-> 下一个 ResBlock / Downsample / Upsample
+```
+
+也就是说：
+
+- `ResBlock` 先做卷积特征变换，并告诉网络“现在是第几个扩散步”
+- `SpatialTransformer` 再让当前图像特征和文本条件发生交互
+
+所以它们不是替代关系，而是互补关系。
+
+---
+
+**ResBlock**
+
+代码在：
+[openaimodel.py#L163](<PATH>)
+
+它是一个带 timestep conditioning 的残差块。
+
+---
+
+**1. 它的输入输出是什么**
+
+`forward` 定义在：
+[openaimodel.py#L243](<PATH>)
+
+```python
+def forward(self, x, emb):
+```
+
+输入：
+
+- `x`：特征图，shape 一般是 `B x C x H x W`
+- `emb`：时间步嵌入，shape 是 `B x emb_channels`
+
+输出：
+
+- 仍然是特征图，shape 通常是 `B x C' x H x W`
+- 如果配置了 `up=True` 或 `down=True`，空间尺寸会变化
+
+---
+
+**2. 它的主体结构**
+
+先看初始化里的三部分。
+
+输入卷积分支：
+[openaimodel.py#L201](<PATH>)
+
+```python
+self.in_layers = nn.Sequential(
+    normalization(channels),
+    nn.SiLU(),
+    conv_nd(dims, channels, self.out_channels, 3, padding=1),
+)
+```
+
+时间步嵌入分支：
+[openaimodel.py#L218](<PATH>)
+
+```python
+self.emb_layers = nn.Sequential(
+    nn.SiLU(),
+    linear(emb_channels, self.out_channels),
+)
+```
+
+输出卷积分支：
+[openaimodel.py#L225](<PATH>)
+
+```python
+self.out_layers = nn.Sequential(
+    normalization(self.out_channels),
+    nn.SiLU(),
+    nn.Dropout(p=dropout),
+    zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)),
+)
+```
+
+skip 分支：
+[openaimodel.py#L234](<PATH>)
+
+```python
+if self.out_channels == channels:
+    self.skip_connection = nn.Identity()
+elif use_conv:
+    self.skip_connection = conv_nd(dims, channels, self.out_channels, 3, padding=1)
+else:
+    self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+```
+
+---
+
+**3. 数学上它在做什么**
+
+如果先忽略 up/down 和 scale-shift 这些分支，它的主干可以写成：
+
+\[
+h_1 = \mathrm{Conv}_1(\phi(\mathrm{Norm}(x)))
+\]
+
+时间步嵌入先经过线性映射：
+
+\[
+e = W_e \phi(\text{temb})
+\]
+
+然后 broadcast 到空间维：
+
+\[
+e \in \mathbb{R}^{B \times C'} \rightarrow \mathbb{R}^{B \times C' \times 1 \times 1}
+\]
+
+加到特征图上：
+
+\[
+h_2 = h_1 + e
+\]
+
+再经过第二段卷积：
+
+\[
+h_3 = \mathrm{Conv}_2(\mathrm{Dropout}(\phi(\mathrm{Norm}(h_2))))
+\]
+
+最后加上 skip：
+
+\[
+y = \mathrm{skip}(x) + h_3
+\]
+
+这就是它的核心。
+
+---
+
+**4. 代码里时间步嵌入是怎么加进去的**
+
+关键在：
+[openaimodel.py#L264](<PATH>)
+
+```python
+emb_out = self.emb_layers(emb).type(h.dtype)
+while len(emb_out.shape) < len(h.shape):
+    emb_out = emb_out[..., None]
+```
+
+这一步把：
+
+```text
+B x C
+```
+
+变成：
+
+```text
+B x C x 1 x 1
+```
+
+然后在默认分支里：
+
+[openaimodel.py#L272](<PATH>)
+
+```python
+h = h + emb_out
+h = self.out_layers(h)
+```
+
+也就是说，SD v1 默认是**加法注入时间步信息**。
+
+这里很重要的一点是：
+
+- 时间步信息不是拼到通道上
+- 也不是只在网络头部注入一次
+- 而是在每个 ResBlock 里都注入一次
+
+这能让整个 U-Net 在所有尺度都感知到当前扩散步 `t`。
+
+---
+
+**5. `use_scale_shift_norm` 是什么**
+
+代码在：
+[openaimodel.py#L267](<PATH>)
+
+```python
+if self.use_scale_shift_norm:
+    scale, shift = th.chunk(emb_out, 2, dim=1)
+    h = out_norm(h) * (1 + scale) + shift
+```
+
+如果打开这个选项，时间步嵌入就不再是简单相加，而是做类似 FiLM / AdaGN 的调制：
+
+\[
+h = \mathrm{Norm}(h) \odot (1 + \gamma) + \beta
+\]
+
+其中：
+
+- `scale = \gamma`
+- `shift = \beta`
+
+这是更强的条件调制方式。
+
+但在 SD v1 默认配置里，这个参数没开，所以默认走的是简单加法分支。
+
+---
+
+**6. `up` / `down` 分支在干什么**
+
+这部分在：
+[openaimodel.py#L207](<PATH>)
+
+如果：
+
+- `up=True`：这个 ResBlock 内部会先做上采样
+- `down=True`：这个 ResBlock 内部会先做下采样
+
+对应前向：
+
+[openaimodel.py#L255](<PATH>)
+
+```python
+if self.updown:
+    in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+    h = in_rest(x)
+    h = self.h_upd(h)
+    x = self.x_upd(x)
+    h = in_conv(h)
+```
+
+也就是说：
+
+- 主分支和 skip 分支会同步上/下采样
+- 然后再做卷积和残差相加
+
+不过 SD v1 默认 `resblock_updown=False`，所以上下采样通常由独立的 `Downsample` / `Upsample` 模块完成，不是这个分支。
+
+---
+
+**7. `zero_module` 为什么重要**
+
+在输出卷积：
+
+[openaimodel.py#L229](<PATH>)
+
+```python
+zero_module(conv_nd(...))
+```
+
+这会把最后一层卷积初始化成 0。
+
+所以刚开始训练时：
+
+\[
+h_3 \approx 0
+\]
+
+整个块近似变成：
+
+\[
+y \approx \mathrm{skip}(x)
+\]
+
+也就是“接近恒等映射”。
+
+这对深网络训练很稳定，尤其 diffusion U-Net 里很常见。
+
+---
+
+**8. SD v1 默认下，ResBlock 的实际 shape 例子**
+
+以第一层为例：
+
+- 输入 `x`: `B x 320 x 64 x 64`
+- 时间步嵌入 `emb`: `B x 1280`
+
+经过：
+
+- `in_layers`: `320 -> 320`
+- `emb_layers`: `1280 -> 320`
+- broadcast 到 `B x 320 x 1 x 1`
+- 相加
+- `out_layers`: `320 -> 320`
+- skip: identity
+
+输出：
+
+```text
+B x 320 x 64 x 64
+```
+
+如果是下一层通道提升，比如 `320 -> 640` 的 block：
+
+- 输入：`B x 320 x 32 x 32`
+- 输出：`B x 640 x 32 x 32`
+- skip 会自动用 `1x1 conv` 把 `320` 投影到 `640`
+
+---
+
+**9. 它对应的论文/实现来源**
+
+这个块不是单一论文里的标准层，而是几类思想融合：
+
+- 残差连接：ResNet
+- 条件时间步注入：DDPM / guided-diffusion / ADM
+- GroupNorm + SiLU：扩散模型与生成模型常用工程变体
+- FiLM/AdaGN 风格条件化：条件归一化思想
+
+如果要抓主来源，可以理解为：
+
+- 结构骨架来自 OpenAI diffusion U-Net 系实现
+- 本仓库基本是沿着 guided-diffusion / improved-diffusion 这条线来的
+
+---
+
+**SpatialTransformer**
+
+代码在：
+[attention.py#L218](<PATH>)
+
+这个模块是 Stable Diffusion 最关键的创新点之一，因为**文本条件就是通过它进来的**。
+
+---
+
+**1. 它解决什么问题**
+
+卷积擅长局部建模，但不擅长：
+
+- 长距离依赖
+- token 级文本条件对齐
+- 全局语义交互
+
+所以 `SpatialTransformer` 做的事是：
+
+> 把二维 feature map 临时拉平成 token 序列，用标准 transformer block 处理，再还原成 feature map。
+
+也就是：
+
+```text
+B x C x H x W
+-> B x (HW) x D
+-> Transformer
+-> B x C x H x W
+```
+
+---
+
+**2. 它的结构**
+
+归一化：
+[attention.py#L231](<PATH>)
+
+```python
+self.norm = Normalize(in_channels)
+```
+
+输入投影：
+[attention.py#L233](<PATH>)
+
+```python
+self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, ...)
+```
+
+transformer 主体：
+[attention.py#L239](<PATH>)
+
+```python
+self.transformer_blocks = nn.ModuleList(
+    [BasicTransformerBlock(inner_dim, n_heads, d_head, ..., context_dim=context_dim)
+     for d in range(depth)]
+)
+```
+
+输出投影：
+[attention.py#L244](<PATH>)
+
+```python
+self.proj_out = zero_module(nn.Conv2d(inner_dim, in_channels, kernel_size=1, ...))
+```
+
+最后残差相加：
+[attention.py#L260](<PATH>)
+
+```python
+return x + x_in
+```
+
+---
+
+**3. 前向过程逐步解释**
+
+前向在：
+[attention.py#L250](<PATH>)
+
+### 第一步：保留残差输入
+
+```python
+x_in = x
+```
+
+### 第二步：归一化 + 1x1 卷积投影
+
+```python
+x = self.norm(x)
+x = self.proj_in(x)
+```
+
+这里把通道从 `in_channels` 投影到：
+
+\[
+inner\_dim = n\_heads \times d\_head
+\]
+
+### 第三步：展平空间维
+
+```python
+x = rearrange(x, 'b c h w -> b (h w) c')
+```
+
+于是：
+
+\[
+B \times C \times H \times W
+\rightarrow
+B \times N \times D
+\]
+
+其中：
+
+\[
+N = H \times W
+\]
+
+这一步之后，每个空间位置都被当成一个 token。
+
+### 第四步：过 transformer block
+
+```python
+for block in self.transformer_blocks:
+    x = block(x, context=context)
+```
+
+### 第五步：还原回 feature map
+
+```python
+x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+```
+
+### 第六步：投影回原通道数并做残差
+
+```python
+x = self.proj_out(x)
+return x + x_in
+```
+
+---
+
+**4. `BasicTransformerBlock` 里面到底做了什么**
+
+定义在：
+[attention.py#L196](<PATH>)
+
+前向主干：
+
+[attention.py#L211](<PATH>)
+
+```python
+x = self.attn1(self.norm1(x)) + x
+x = self.attn2(self.norm2(x), context=context) + x
+x = self.ff(self.norm3(x)) + x
+```
+
+所以一层 block 的顺序是：
+
+1. self-attention
+2. cross-attention
+3. feed-forward
+
+这很重要，因为它不是“只有 cross-attention”。
+
+---
+
+**5. `CrossAttention` 数学上是什么**
+
+定义在：
+[attention.py#L152](<PATH>)
+
+如果输入是：
+
+- query 序列 `x`
+- context 序列 `c`
+
+则：
+
+\[
+Q = xW_Q,\quad K = cW_K,\quad V = cW_V
+\]
+
+注意力权重：
+
+\[
+A = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)
+\]
+
+输出：
+
+\[
+\mathrm{Attn}(x,c)=AV
+\]
+
+代码对应：
+
+[attention.py#L173](<PATH>)
+
+```python
+q = self.to_q(x)
+k = self.to_k(context)
+v = self.to_v(context)
+```
+
+[attention.py#L180](<PATH>)
+
+```python
+sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+attn = sim.softmax(dim=-1)
+```
+
+[attention.py#L191](<PATH>)
+
+```python
+out = einsum('b i j, b j d -> b i d', attn, v)
+```
+
+---
+
+**6. 为什么它叫 `SpatialTransformer`**
+
+因为它并不是原生 transformer 接 token 序列输入，而是：
+
+- 输入是图像空间特征图
+- 中间临时转成 token 序列
+- 再转回空间特征图
+
+所以它本质是：
+
+> transformer block 嵌入到空间卷积网络中的桥接器
+
+这也是为什么它特别适合插在 U-Net 的若干分辨率位置。
+
+---
+
+**7. SD v1 默认配置下，`SpatialTransformer` 的具体维度**
+
+配置里：
+
+- `num_heads = 8`
+- `legacy = False`
+- `num_head_channels` 没显式给，所以默认走 `dim_head = ch // num_heads`
+
+在 `UNetModel` 里生成 transformer 时：
+
+- 若 `ch = 320`，则 `dim_head = 40`
+- 若 `ch = 640`，则 `dim_head = 80`
+- 若 `ch = 1280`，则 `dim_head = 160`
+
+所以：
+
+\[
+inner\_dim = n\_heads \times d\_head = ch
+\]
+
+也就是说在 SD v1 默认配置里，`SpatialTransformer` 的内部维度和当前通道数恰好一致。
+
+举个例子，在 `64x64` 分辨率层：
+
+- 输入：`B x 320 x 64 x 64`
+- 展平后：`B x 4096 x 320`
+- 文本 context：`B x 77 x 768`
+
+然后在 cross-attention 中：
+
+- query 来自 4096 个图像 token
+- key/value 来自 77 个文本 token
+
+这就是文本控制图像生成的核心机制。
+
+---
+
+**8. self-attention 和 cross-attention 在这里的分工**
+
+在 `BasicTransformerBlock` 里：
+
+- `attn1` 是 self-attention
+- `attn2` 是 cross-attention
+
+所以每层 block 先做：
+
+### self-attention
+让图像内部各空间位置互相看见：
+
+\[
+x \leftarrow \mathrm{SelfAttn}(x) + x
+\]
+
+### cross-attention
+再让图像 token 去对齐文本 token：
+
+\[
+x \leftarrow \mathrm{CrossAttn}(x, c) + x
+\]
+
+### FFN
+最后做逐 token 非线性变换：
+
+\[
+x \leftarrow \mathrm{FFN}(x) + x
+\]
+
+这相当于：
+
+- 先整理图像内部关系
+- 再读文本条件
+- 再做局部表征更新
+
+---
+
+**9. `proj_out` 也用 `zero_module` 是为什么**
+
+在：
+[attention.py#L244](<PATH>)
+
+```python
+self.proj_out = zero_module(nn.Conv2d(inner_dim, in_channels, 1))
+```
+
+这样初始化时，transformer 分支一开始几乎不破坏原始卷积特征：
+
+\[
+x_{out} \approx x_{in}
+\]
+
+这和 ResBlock 里最后一层卷积置零是同样思路：
+
+- 先近似恒等映射
+- 再逐渐学会利用 attention
+
+训练会更稳定。
+
+---
+
+**10. 这两个模块在网络里是怎么协作的**
+
+你可以把整个 U-Net 某一层理解成：
+
+### ResBlock
+回答：
+
+> “在当前扩散步 t 下，这个局部卷积特征应该怎么更新？”
+
+### SpatialTransformer
+回答：
+
+> “这些空间位置之间该如何全局交互？又该如何根据文本条件重新分配注意力？”
+
+所以：
+
+- `ResBlock` 偏局部、卷积、时间步条件
+- `SpatialTransformer` 偏全局、序列建模、文本条件
+
+前者更像“基础特征加工器”，后者更像“全局语义协调器”。
+
+---
+
+**11. 如果把它们压成一组公式**
+
+在一个含 transformer 的 U-Net 层里，可以抽象成：
+
+先做卷积残差更新：
+
+\[
+h_1 = \mathrm{ResBlock}(x, e_t)
+\]
+
+再做空间 transformer 更新：
+
+\[
+h_2 = \mathrm{SpatialTransformer}(h_1, c)
+\]
+
+其中：
+
+- \(e_t\) 是 timestep embedding
+- \(c\) 是文本 context
+
+如果展开 `SpatialTransformer` 内部：
+
+\[
+h_2 = h_1 + \mathrm{Proj}_{out}\left(
+\mathrm{Transformer}\left(
+\mathrm{Proj}_{in}(\mathrm{Norm}(h_1)), c
+\right)\right)
+\]
+
+这基本就是它们协同工作的数学概括。
+
+---
+
+**12. 最后给你一个最实用的阅读抓手**
+
+以后你再看 SD 的 U-Net，看到一层里有这两个模块，直接这样理解就够快：
+
+- `ResBlock`
+  用 `t` 调制卷积特征，处理局部结构
+
+- `SpatialTransformer`
+  把当前 feature map 拉平成 token 序列，先做 self-attention，再用 cross-attention 读文本条件，处理全局语义和文本对齐
+
+---
+
+**一句话总结**
+
+`ResBlock` 是扩散 U-Net 的“局部卷积残差 + 时间步条件”核心单元；
+`SpatialTransformer` 是 Stable Diffusion 的“空间 token 化 + self/cross-attention + 文本条件注入”核心单元。
+前者让网络知道“现在在第几步、局部该怎么修”，后者让网络知道“全局哪些位置互相关联、文本在说什么”。
+
+如果你愿意，我下一步可以继续做两件很自然的事：
+
+1. 按 SD v1 默认配置，把某一个具体分辨率层里 `ResBlock -> SpatialTransformer -> ResBlock` 的每一步 tensor shape 全部列出来
+2. 直接结合 prompt 文本编码，把 `context: B x 77 x 768` 是怎么在 cross-attention 里影响 `B x C x H x W` 的，举一个更具体的例子
